@@ -1,0 +1,61 @@
+# Default simulator parameters. Spec: docs/PARAMETERS.md (meaning, ranges).
+# Validated by scout_planner.config.Params: unknown keys and out-of-range values
+# fail at load time. A test asserts this file equals the code defaults.
+# [a, b] pairs are [min, max] ranges.
+
+team:                          # initial team
+  full_time_count: 24
+  freelance_count: 16
+  freelance_weekly_hours: [8.0, 25.0]   # drawn each week per freelancer
+  skills_per_scout: [1, 4]
+  leave_days_per_year: 25      # per full-time scout
+  follow_hiring_plan: true     # hires from the capacity plan join during the year
+
+demand:                        # what actually arrives (D-014)
+  start_load: 0.70             # initial team's load at month 0; sets base volume (D-003)
+  actual_growth: 4.0           # run-rate at month 12 / run-rate at month 0
+  live_view_share: 0.40
+  seasonality_strength: 1.0    # 0 = flat year, 1 = default transfer-window peaks
+  history_months: 48           # D-004
+  turnaround_days: 14          # promised delivery time
+  desk_hours: [4.0, 10.0]
+  writeup_hours: [2.0, 4.0]
+  live_view_hours: 8.0         # a live view costs the scout this many hours that day
+
+capacity_plan:                 # what the agency believes and hires for (D-014)
+  assumed_growth: 4.0
+  quantile: 0.80               # planning quantile (P80)
+  target_utilisation: 0.80
+  lead_time_full_time_months: 3
+  lead_time_freelance_months: 1
+  persistent_gap_months: 3     # consecutive gap months that justify a full-time hire
+
+automation:                    # video pre-screen tool
+  enabled: false
+  desk_reduction: 0.40
+  rework_rate: 0.15
+  rework_overhead_hours: 1.0
+  monthly_cost: 1500.0
+
+assignment:                    # daily who-does-which-work decision (D-010, D-011)
+  policy: optimiser            # fcfs | edf | optimiser
+  cadence: daily               # daily | weekly
+  unit: task                   # task | bundle
+  horizon_days: 7              # rolling window each assignment run looks ahead
+  weights:                     # optimiser objective
+    lateness: 100.0
+    cost: 1.0
+    continuity: 5.0
+    churn: 3.0
+  time_limit_s: 1.0            # max seconds per optimiser solve
+
+cost:
+  full_time_monthly_salary: 4500.0
+  freelance_premium: 1.5       # freelance hourly rate / salaried hourly equivalent
+  late_penalty: 1000.0         # per late report
+
+sim:
+  seeds: 3                     # replications
+  seed: 42                     # base seed; every random stream derives from it (D-015)
+  months: 12
+  target_on_time: 0.95

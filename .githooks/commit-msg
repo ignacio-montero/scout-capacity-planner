@@ -1,0 +1,34 @@
+#!/bin/sh
+# Guardrail (D-002): reject a commit message that contains any term listed in
+# .private/banned-terms.txt (one term per line; '#' comments and blank lines
+# ignored). Case-insensitive, whole word. The list is untracked, so where it is
+# absent (fresh clone, CI) this hook does nothing.
+# Enabled by `make setup` (git config core.hooksPath .githooks).
+
+msg_file="$1"
+root=$(git rev-parse --show-toplevel) || exit 0
+terms_file="$root/.private/banned-terms.txt"
+[ -f "$terms_file" ] || exit 0
+
+# Git drops '#' lines from the message by default; ignore them here too.
+message=$(grep -v '^#' "$msg_file")
+
+status=0
+while IFS= read -r term || [ -n "$term" ]; do
+    term=$(printf '%s' "$term" | tr -d '\r' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+    case "$term" in
+        '' | '#'*) continue ;;
+    esac
+    if printf '%s\n' "$message" | grep -qiE "(^|[^[:alpha:]])${term}([^[:alpha:]]|$)"; then
+        # Print the term masked so the hook's own output stays clean.
+        first=$(printf '%s' "$term" | cut -c1)
+        rest=$(printf '%s' "$term" | cut -c2- | sed 's/./*/g')
+        echo "commit-msg: guardrail term '${first}${rest}' found in the commit message (D-002)." >&2
+        status=1
+    fi
+done < "$terms_file"
+
+if [ "$status" -ne 0 ]; then
+    echo "commit-msg: reword the message; see .private/banned-terms.txt." >&2
+fi
+exit "$status"
