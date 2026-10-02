@@ -31,8 +31,8 @@ format:  ## auto-format and apply safe lint fixes
 
 ## --- pipeline stages (dev run folder: $(DEV_RUN)) -----------------------------------
 
-data:
-	$(call todo,M1)
+data:  ## [1] synthetic world -> $(DEV_RUN)/raw/*.parquet
+	uv run python -m scout_planner.cli data --params $(PARAMS) --out $(DEV_RUN)
 
 forecast:
 	$(call todo,M2)
@@ -51,8 +51,8 @@ run:
 sweep:
 	$(call todo,M4)
 
-app:
-	$(call todo,M5)
+app:  ## start the simulator app and its background worker (Ctrl-C stops both)
+	uv run python -m scout_planner.serve
 
 charts:
 	$(call todo,M6)

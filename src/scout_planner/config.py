@@ -91,6 +91,9 @@ class DemandParams(_StrictModel):
     live_view_share: float = Field(0.40, ge=0.0, le=1.0)
     seasonality_strength: float = Field(1.0, ge=0.0, le=2.0)
     history_months: int = Field(48, ge=36, le=72)
+    # Organic growth of the history before the simulated year (D-004); the
+    # simulated year itself follows ``actual_growth`` instead (D-014).
+    history_growth_per_year: float = Field(0.15, ge=-0.5, le=1.0)
     turnaround_days: int = Field(14, ge=7, le=28)
     desk_hours: TaskHoursRange = (4.0, 10.0)
     writeup_hours: TaskHoursRange = (2.0, 4.0)

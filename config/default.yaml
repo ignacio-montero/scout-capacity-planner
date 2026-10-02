@@ -17,6 +17,7 @@ demand:                        # what actually arrives (D-014)
   live_view_share: 0.40
   seasonality_strength: 1.0    # 0 = flat year, 1 = default transfer-window peaks
   history_months: 48           # D-004
+  history_growth_per_year: 0.15  # organic growth of the history (0.15 = +15%/year)
   turnaround_days: 14          # promised delivery time
   desk_hours: [4.0, 10.0]
   writeup_hours: [2.0, 4.0]
