@@ -1,0 +1,32 @@
+# Private, never committed: original brief and the guardrail term list
+.private/
+
+# Generated data (regenerate with `make data` etc.).
+# data/published/ holds the small precomputed outputs the app and README need.
+data/*
+!data/published/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+build/
+dist/
+
+# Tooling caches
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Streamlit local secrets
+.streamlit/secrets.toml
+
+# Env
+.env
+
+# OS / editors
+.DS_Store
+.idea/
+.vscode/
