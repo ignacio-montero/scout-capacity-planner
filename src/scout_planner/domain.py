@@ -114,6 +114,13 @@ class Request:
 
     ``desk_hours`` / ``writeup_hours`` are the true durations, sampled at
     generation (D-015: pre-drawn per entity).
+
+    ``rework_draw`` is a uniform number in [0, 1), also pre-drawn at
+    generation. When the pre-screen tool is on, its output for this request is
+    unusable iff ``rework_draw < rework_rate`` (see :meth:`needs_rework`). Two
+    runs with different rework rates therefore fail on nested sets of requests
+    instead of on unrelated ones (common random numbers, D-015). The default
+    1.0 means "never fails", convenient for hand-built requests in tests.
     """
 
     request_id: str
@@ -126,6 +133,7 @@ class Request:
     desk_hours: float
     writeup_hours: float
     period: Period = "future"
+    rework_draw: float = 1.0
 
     def __post_init__(self) -> None:
         _check_literal(self.period, Period, "period")
@@ -133,6 +141,12 @@ class Request:
             raise ValueError(f"request {self.request_id}: due_date before received_date")
         if self.desk_hours <= 0 or self.writeup_hours <= 0:
             raise ValueError(f"request {self.request_id}: task hours must be positive")
+        if not 0.0 <= self.rework_draw <= 1.0:
+            raise ValueError(f"request {self.request_id}: rework_draw must be in [0, 1]")
+
+    def needs_rework(self, rework_rate: float) -> bool:
+        """Whether the pre-screen output for this request is unusable at ``rework_rate``."""
+        return self.rework_draw < rework_rate
 
     @property
     def conflict_clubs(self) -> frozenset[str]:
@@ -249,6 +263,10 @@ class WorkItem:
     * ``depends_on`` lists ids of unfinished prerequisite items, whether they
       are in the same pool or frozen in a scout's queue. Empty = ready now.
     * ``fixed_date`` and ``region`` are set only for live views.
+    * ``request_scout_ids``: scouts already on this item's request *outside the
+      pool* (they hold started work on it or finished part of it). Items of the
+      same request that are still in the pool are not listed: the policy sees
+      them directly. Read only by the optimiser's continuity term (M3).
     """
 
     item_id: str
@@ -264,12 +282,14 @@ class WorkItem:
     fixed_date: dt.date | None = None
     region: str | None = None
     depends_on: tuple[str, ...] = ()
+    request_scout_ids: frozenset[str] = frozenset()
 
     def __post_init__(self) -> None:
         _check_literal(self.kind, ItemKind, "work item kind")
         _set(self, "task_ids", tuple(self.task_ids))
         _set(self, "conflict_clubs", frozenset(self.conflict_clubs))
         _set(self, "depends_on", tuple(self.depends_on))
+        _set(self, "request_scout_ids", frozenset(self.request_scout_ids))
         if not self.task_ids:
             raise ValueError(f"work item {self.item_id} has no tasks")
         if self.hours <= 0:
@@ -294,6 +314,7 @@ class WorkItem:
         remaining_hours: float | None = None,
         current_scout_id: str | None = None,
         done_task_ids: frozenset[str] = frozenset(),
+        request_scout_ids: frozenset[str] = frozenset(),
     ) -> WorkItem:
         """Wrap one task (``assignment.unit = task``); item id = task id."""
         return cls(
@@ -310,6 +331,7 @@ class WorkItem:
             fixed_date=task.fixture_date,
             region=task.region,
             depends_on=tuple(p for p in task.prerequisites if p not in done_task_ids),
+            request_scout_ids=request_scout_ids,
         )
 
     @classmethod
@@ -321,6 +343,7 @@ class WorkItem:
         *,
         current_scout_id: str | None = None,
         done_task_ids: frozenset[str] = frozenset(),
+        request_scout_ids: frozenset[str] = frozenset(),
     ) -> WorkItem:
         """Desk review + write-up as one item for one scout (``assignment.unit = bundle``).
 
@@ -345,6 +368,7 @@ class WorkItem:
             depends_on=tuple(
                 p for p in writeup.prerequisites if p != desk.task_id and p not in done_task_ids
             ),
+            request_scout_ids=request_scout_ids,
         )
 
 
