@@ -130,6 +130,10 @@ class CapacityPlanParams(_StrictModel):
     lead_time_full_time_months: int = Field(3, ge=0, le=6)
     lead_time_freelance_months: int = Field(1, ge=0, le=3)
     persistent_gap_months: int = Field(3, ge=1, le=12)
+    # Which hire types the plan may use: ``rule`` = full-time for persistent
+    # gaps + freelance for peaks (plan.greedy_hiring); the other two cover every
+    # gap with one type only (what-if comparisons for the headline sweep).
+    hire_mix: Literal["rule", "freelance_only", "full_time_only"] = "rule"
 
 
 class AutomationParams(_StrictModel):

@@ -9,24 +9,34 @@ A sweep file::
       demand.actual_growth: [1.0, 4.0]
     fixed:                           # overrides applied to every run
       sim.seeds: 2
+    link:                            # optional: target <- source, per combination
+      capacity_plan.assumed_growth: demand.actual_growth
 
 expands into ``2 x 2 = 4`` parameter sets: ``base`` + ``fixed`` + one
-combination of ``vary``, each validated by ``config.apply_overrides``. The
-first ``vary`` key changes slowest (like nested loops), so the run list reads
-in a predictable order. This is a *full factorial design*: every combination,
-so each parameter's effect can be read at every level of the others.
+combination of ``vary``, then ``link`` (each target takes its source's value
+in that combination: "the agency assumes the growth that actually happens"),
+each validated by ``config.apply_overrides``. The first ``vary`` key changes
+slowest (like nested loops), so the run list reads in a predictable order.
+This is a *full factorial design*: every combination, so each parameter's
+effect can be read at every level of the others. ``link`` keeps a factorial
+design from wasting runs on combinations nobody wants (assumed 1x with actual
+4x) when the question is about something else.
 
 Expansion (:func:`load_sweep`, :func:`expand`) is pure. Queueing goes
 through the run store; :func:`publish` flattens the finished runs into
-``data/published/<sweep>_summary.parquet`` (G5).
+``data/published/<sweep>_summary.parquet`` (G5), written atomically (temp
+file + ``os.replace``), so sweeps running at the same time into different
+``--root`` folders can all publish into the shared folder safely.
 """
 
 from __future__ import annotations
 
 import itertools
 import json
+import os
+import tempfile
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -60,6 +70,7 @@ class SweepSpec:
     base: Path
     vary: dict[str, list[Any]]
     fixed: dict[str, Any]
+    link: dict[str, str] = field(default_factory=dict)  # target key -> source key
 
 
 @dataclass(frozen=True)
@@ -80,7 +91,7 @@ def parse_sweep(data: Any) -> SweepSpec:
     """Validate the structure of a decoded sweep file (values are checked by :func:`expand`)."""
     if not isinstance(data, Mapping):
         raise ValueError("a sweep file must be a mapping")
-    unknown = set(data) - {"name", "base", "vary", "fixed"}
+    unknown = set(data) - {"name", "base", "vary", "fixed", "link"}
     if unknown:
         raise ValueError(f"unknown sweep keys: {sorted(unknown)}")
     name = data.get("name")
@@ -100,12 +111,70 @@ def parse_sweep(data: Any) -> SweepSpec:
     both = set(vary) & set(fixed)
     if both:
         raise ValueError(f"parameters both varied and fixed: {sorted(both)}")
+    link = data.get("link") or {}
+    _check_link(link, vary, fixed)
     return SweepSpec(
         name=name.strip(),
         base=_resolve(data.get("base", "config/default.yaml")),
         vary={str(k): list(v) for k, v in vary.items()},
         fixed={str(k): v for k, v in fixed.items()},
+        link={str(k): str(v) for k, v in link.items()},
     )
+
+
+def _leaves(data: Mapping[str, Any], prefix: str = "") -> dict[str, Any]:
+    """Nested parameter dict -> ``{"team.full_time_count": 24, ...}`` (leaf settings only)."""
+    flat: dict[str, Any] = {}
+    for key, value in data.items():
+        if isinstance(value, Mapping):
+            flat.update(_leaves(value, f"{prefix}{key}."))
+        else:
+            flat[f"{prefix}{key}"] = value
+    return flat
+
+
+PARAM_KEYS: frozenset[str] = frozenset(_leaves(Params().model_dump(mode="json")))
+
+
+def _check_link(link: Any, vary: Mapping[str, Any], fixed: Mapping[str, Any]) -> None:
+    """``link`` is ``{target: source}`` over existing leaf parameters, without cycles.
+
+    A target may not also be varied or fixed: its value would be overwritten
+    by the link, so the file would say two contradictory things.
+    """
+    if not isinstance(link, Mapping):
+        raise ValueError("'link' must map target parameters to source parameters")
+    for target, source in link.items():
+        for what, key in (("target", target), ("source", source)):
+            if not isinstance(key, str) or key not in PARAM_KEYS:
+                raise ValueError(f"link {what} {key!r} is not a parameter")
+        if target == source:
+            raise ValueError(f"link {target!r} points to itself")
+        if target in vary:
+            raise ValueError(f"link target {target!r} is also varied")
+        if target in fixed:
+            raise ValueError(f"link target {target!r} is also fixed")
+    for start in link:
+        seen, key = [start], link[start]
+        while key in link:
+            if key in seen:
+                raise ValueError(f"link cycle: {' -> '.join([*seen, key])}")
+            seen.append(key)
+            key = link[key]
+
+
+def apply_links(params: Params, link: Mapping[str, str]) -> Params:
+    """Set each link target to its source's value (a chain resolves to its root)."""
+    if not link:
+        return params
+    flat = _leaves(params.model_dump(mode="json"))
+
+    def root_value(key: str) -> Any:
+        while key in link:
+            key = link[key]
+        return flat[key]
+
+    return apply_overrides(params, {target: root_value(target) for target in link})
 
 
 def load_sweep(path: str | Path) -> SweepSpec:
@@ -125,13 +194,14 @@ def run_name(sweep: str, values: Mapping[str, Any]) -> str:
 
 
 def expand(spec: SweepSpec, base: Params | None = None) -> list[SweepRun]:
-    """Every combination of ``vary`` on top of ``base`` + ``fixed`` (validated, file order)."""
+    """Every combination of ``vary`` on top of ``base`` + ``fixed``, then ``link`` (file order)."""
     start = apply_overrides(load_params(spec.base) if base is None else base, spec.fixed)
     keys = list(spec.vary)
     out = []
     for combo in itertools.product(*(spec.vary[k] for k in keys)):
         values = dict(zip(keys, combo, strict=True))
-        out.append(SweepRun(run_name(spec.name, values), values, apply_overrides(start, values)))
+        params = apply_links(apply_overrides(start, values), spec.link)
+        out.append(SweepRun(run_name(spec.name, values), values, params))
     return out
 
 
@@ -160,18 +230,37 @@ def _get(params: Params, dotted: str) -> Any:
 
 
 def published_columns(spec: SweepSpec) -> list[str]:
-    """Parameter columns of the published table: varied, fixed, then the always-present ones."""
+    """Named parameter columns: varied, fixed, linked, then the always-present ones.
+
+    :func:`summary_rows` adds a column for every other leaf parameter that
+    differs from the code defaults, so a row describes its run completely.
+    """
     cols = list(spec.vary) + [k for k in spec.fixed if k not in spec.vary]
+    cols += [k for k in spec.link if k not in cols]
     cols += [k for k in ALWAYS_PUBLISHED if k not in cols]
     return cols
+
+
+_DEFAULT_LEAVES = _leaves(Params().model_dump(mode="json"))
+
+
+def differing_leaves(params: Params) -> dict[str, Any]:
+    """Every leaf parameter whose value differs from ``Params()``, in parameter order."""
+    flat = _leaves(params.model_dump(mode="json"))
+    return {k: v for k, v in flat.items() if v != _DEFAULT_LEAVES[k]}
 
 
 def summary_rows(spec: SweepSpec, sweep_id: str, root: Path | str | None = None) -> pd.DataFrame:
     """One row per finished run of ``sweep_id``: name, run_id, parameters, flat metrics (G5).
 
     Runs that are not ``done`` (failed, cancelled, still queued) are skipped.
-    Parameter columns hold the run's actual value from its ``params.yaml``; a
-    ``fixed`` key whose value is a mapping is stored as JSON text.
+    Parameter columns hold the run's actual value from its ``params.yaml``: the
+    named columns of :func:`published_columns` (a ``fixed`` key whose value is
+    a mapping is stored as JSON text), then a dotted leaf column for every
+    parameter that differs from the code defaults in any run, e.g. the
+    changes a custom ``base`` file makes. Defaults + those columns rebuild each
+    run's parameters exactly (``results.params_for_sweep_row``). Ranges stay
+    lists.
     """
     rows = []
     for status in runs.list_runs(root):
@@ -183,12 +272,17 @@ def summary_rows(spec: SweepSpec, sweep_id: str, root: Path | str | None = None)
         row: dict[str, Any] = {"name": status.name, "run_id": status.run_id}
         for key in published_columns(spec):
             value = _get(params, key)
-            row[key] = (
-                json.dumps(value, sort_keys=True) if isinstance(value, dict | list) else value
-            )
-        row.update(metrics.flatten_summary(summary))
-        rows.append(row)
-    return pd.DataFrame(rows)
+            row[key] = json.dumps(value, sort_keys=True) if isinstance(value, dict) else value
+        rows.append((row, params, metrics.flatten_summary(summary)))
+    named = set(published_columns(spec))
+    extra: dict[str, None] = {}  # ordered set: parameter order, first seen first
+    for _, params, _ in rows:
+        extra.update(dict.fromkeys(k for k in differing_leaves(params) if k not in named))
+    out = []
+    for row, params, flat_metrics in rows:
+        leaves = _leaves(params.model_dump(mode="json"))
+        out.append({**row, **{k: leaves[k] for k in extra}, **flat_metrics})
+    return pd.DataFrame(out)
 
 
 def publish(
@@ -204,7 +298,16 @@ def publish(
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     path = out / f"{runs.slugify(spec.name)}{PUBLISHED_SUFFIX}"
-    df.to_parquet(path, index=False)
+    # Atomic publish: readers (the app) and other sweeps publishing at the same
+    # time never see a half-written file; a unique temp name per writer.
+    fd, tmp = tempfile.mkstemp(dir=out, prefix=f".{path.name}.", suffix=".tmp")
+    os.close(fd)
+    try:
+        df.to_parquet(tmp, index=False)
+        os.replace(tmp, path)
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise
     return path
 
 
@@ -220,6 +323,8 @@ def latest_sweep_id(name: str, root: Path | str | None = None) -> str | None:
 __all__: Sequence[str] = (
     "SweepRun",
     "SweepSpec",
+    "apply_links",
+    "differing_leaves",
     "expand",
     "load_sweep",
     "new_sweep_id",

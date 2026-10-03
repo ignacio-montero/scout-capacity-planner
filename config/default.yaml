@@ -34,6 +34,7 @@ capacity_plan:                 # what the agency believes and hires for (D-014)
   lead_time_full_time_months: 3
   lead_time_freelance_months: 1
   persistent_gap_months: 3     # consecutive gap months that justify a full-time hire
+  hire_mix: rule               # rule | freelance_only | full_time_only
 
 automation:                    # video pre-screen tool
   enabled: false

@@ -1,5 +1,6 @@
 # Small sweep run by `make all` (a few minutes): is the optimiser worth it, at
-# flat demand and at the 4x growth of the headline question?
+# flat demand and at the 4x growth of the headline question? 2 x 2 = 4 runs x
+# 2 seeds, optimiser at a 0.3 s solver limit.
 name: quick
 base: config/default.yaml
 vary:
@@ -7,3 +8,4 @@ vary:
   demand.actual_growth: [1.0, 4.0]
 fixed:
   sim.seeds: 2
+  assignment.time_limit_s: 0.3

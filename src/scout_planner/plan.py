@@ -84,6 +84,20 @@ utilisation slack, not hires), take the skill with the largest shortfall:
   allocation is re-solved before the next decision, so one hire can also
   close another skill's gap (it frees a multi-skilled scout).
 
+One-type plans (``capacity_plan.hire_mix``)
+-------------------------------------------
+``rule`` (the default) is everything above. The two what-if mixes replace the
+persistent/peak split with a single hire type, walking months the same way
+(largest shortfall first, re-allocating after every hire):
+
+* ``freelance_only``: every shortfall run gets freelancers (freelance lead
+  time), sized to the run's largest shortfall, exactly like a peak above.
+* ``full_time_only``: every shortfall run gets full-timers (full-time lead
+  time). With no freelancers to take the peaks, they are sized to the run's
+  **largest** shortfall too, so a seasonal peak is staffed all year: that
+  idle cost is the point of the comparison. No bridging: months before a
+  late full-timer can join stay short.
+
 This is a *greedy* heuristic (each decision is the locally sensible one,
 never revisited), not an optimisation: the simulation is where its cost is
 judged.
@@ -382,6 +396,22 @@ def greedy_hiring(
             hires[key] = dataclasses.replace(old, count=old.count + count)
         refresh(join)
         return join
+
+    if cp.hire_mix != "rule":
+        only = "freelance" if cp.hire_mix == "freelance_only" else "full_time"
+        for m in range(n_months):
+            stuck_one: set[int] = set()
+            for _ in range(100 * n_skills):
+                short = [j for j in range(n_skills) if j not in stuck_one and gap[j, m] > tol]
+                if not short:
+                    break
+                j = max(short, key=lambda s: (gap[s, m], -s))
+                run = _run_length(gap[j], m, tol)
+                why = f"{cp.hire_mix}: {run} month(s) short from {months[m]:%Y-%m}"
+                join = hire(j, only, m, range(m, m + run), gap[j], "max", why)
+                if join is None or join > m:
+                    stuck_one.add(j)
+        return list(hires.values()), hired["full_time"] + hired["freelance"]
 
     for m in range(n_months):
         stuck: set[int] = set()  # skills whose month-m shortfall no hire can reach in time

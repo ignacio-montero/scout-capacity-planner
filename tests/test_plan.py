@@ -472,3 +472,67 @@ def test_cli_reports_missing_inputs(tmp_path: Path, capsys: pytest.CaptureFixtur
     capsys.readouterr()
     assert cli.main(["plan", "--run", str(run)]) == 2
     assert "run `forecast` first" in capsys.readouterr().err
+
+
+# --- capacity_plan.hire_mix -----------------------------------------------------------------
+
+FL_ONLY = apply_overrides(P, {"capacity_plan.hire_mix": "freelance_only"})
+FT_ONLY = apply_overrides(P, {"capacity_plan.hire_mix": "full_time_only"})
+
+
+def test_freelance_only_covers_a_persistent_gap_with_freelancers() -> None:
+    # The rule would hire one full-timer for this 4-month run (see above).
+    gaps = [0.0] * 4 + [0.5] * 4 + [0.0] * 4
+    hires, hired = hires_for(gaps, params=FL_ONLY)
+    assert [(h.month_to_act, h.joins_month, h.hire_type) for h in hires] == [(3, 4, "freelance")]
+    assert hires[0].reason.startswith("freelance_only")
+    assert ((np.array(gaps) * FT_CAP - hired) <= TOL + 1e-6).all()
+
+
+def test_full_time_only_covers_a_peak_with_full_timers_sized_to_the_peak() -> None:
+    # A 2-month peak: the rule would use freelancers. Full-time only sizes to the
+    # peak month and keeps them for the rest of the year.
+    gaps = [0.0] * 6 + [1.2, 2.5] + [0.0] * 4
+    hires, hired = hires_for(gaps, params=FT_ONLY)
+    expected = int(np.ceil((2.5 * FT_CAP[7] - TOL) / FT_CAP[7]))
+    assert [(h.month_to_act, h.joins_month, h.hire_type, h.count) for h in hires] == [
+        (3, 6, "full_time", expected)
+    ]
+    np.testing.assert_allclose(hired, np.r_[np.zeros(6), expected * FT_CAP[6:]])
+
+
+def test_full_time_only_has_no_bridge_so_early_months_stay_short() -> None:
+    gaps = [1.0] * 12
+    hires, hired = hires_for(gaps, params=FT_ONLY)
+    assert {h.hire_type for h in hires} == {"full_time"}
+    assert hires[0].joins_month == 3 and "late" in hires[0].reason
+    assert (hired[:3] == 0).all()
+    assert ((np.array(gaps) * FT_CAP - hired)[3:] <= TOL + 1e-6).all()
+
+
+def test_rule_mix_is_the_default_behaviour(world: g.World, built) -> None:
+    fc, capacity, hiring = built
+    explicit = apply_overrides(P, {"capacity_plan.hire_mix": "rule"})
+    cap2, hire2 = p.build_capacity_plan(world.scouts, world.scout_unavailability, fc, explicit)
+    pd.testing.assert_frame_equal(capacity, cap2)
+    pd.testing.assert_frame_equal(hiring, hire2)
+    assert set(hiring["hire_type"]) == {"full_time", "freelance"}
+
+
+@pytest.mark.parametrize(
+    ("mix", "kind"), [("freelance_only", "freelance"), ("full_time_only", "full_time")]
+)
+def test_one_type_mixes_on_the_default_world(world: g.World, built, mix: str, kind: str) -> None:
+    fc, _, rule_hiring = built
+    params = apply_overrides(P, {"capacity_plan.hire_mix": mix})
+    capacity, hiring = p.build_capacity_plan(world.scouts, world.scout_unavailability, fc, params)
+    assert len(hiring) and set(hiring["hire_type"]) == {kind}
+    lead = (
+        P.capacity_plan.lead_time_freelance_months
+        if kind == "freelance"
+        else P.capacity_plan.lead_time_full_time_months
+    )
+    assert ((hiring["joins_month"] - hiring["month_to_act"]) == lead).all()
+    # Every month a hire of this type could reach ends covered (within tolerance).
+    reachable = capacity[capacity["month"] >= f.plan_months(P)[lead]]
+    assert (reachable["gap_after_hires_hours"] <= p.hiring_tolerance(P) + 1e-6).all()

@@ -1,0 +1,13 @@
+# How does the answer change with the size of the growth? Flat, 2x and 4x
+# demand, the agency planning for exactly what arrives (assumed = actual),
+# EDF vs the optimiser. 3 x 2 = 6 runs x 3 seeds.
+name: growth
+base: config/default.yaml
+vary:
+  demand.actual_growth: [1.0, 2.0, 4.0]
+  assignment.policy: [edf, optimiser]
+fixed:
+  sim.seeds: 3
+  assignment.time_limit_s: 0.3
+link:
+  capacity_plan.assumed_growth: demand.actual_growth

@@ -72,7 +72,9 @@ def test_unknown_or_invalid_parameters_fail_at_expansion(tmp_path) -> None:
         sweep.expand(sweep.load_sweep(_write(tmp_path, bad_value)))
 
 
-@pytest.mark.parametrize("name", ["quick", "cadence", "headline"])
+@pytest.mark.parametrize(
+    "name", ["quick", "cadence", "headline", "growth", "forecast_error", "baseline"]
+)
 def test_shipped_sweep_files_expand(name) -> None:
     spec = sweep.load_sweep(SWEEPS_DIR / f"{name}.yaml")
     expanded = sweep.expand(spec)
@@ -178,3 +180,174 @@ def test_cli_sweep_executes_and_publishes(tmp_path) -> None:
     # --publish-only republishes the latest execution
     assert cli.main([*args, "--publish-only", "--published-dir", str(tmp_path / "p2")]) == 0
     assert (tmp_path / "p2" / "tiny_summary.parquet").is_file()
+
+
+# --- link: target <- source ----------------------------------------------------------
+
+LINKED = {
+    "name": "linked",
+    "base": "config/default.yaml",
+    "vary": {"demand.actual_growth": [1.0, 2.0, 4.0], "assignment.policy": ["edf"]},
+    "fixed": {"sim.seeds": 2},
+    "link": {"capacity_plan.assumed_growth": "demand.actual_growth"},
+}
+
+
+def test_link_copies_the_source_into_every_combination(tmp_path) -> None:
+    expanded = sweep.expand(sweep.load_sweep(_write(tmp_path, LINKED)))
+    pairs = [
+        (r.params.demand.actual_growth, r.params.capacity_plan.assumed_growth) for r in expanded
+    ]
+    assert pairs == [(1.0, 1.0), (2.0, 2.0), (4.0, 4.0)]
+    assert "assumed_growth" not in expanded[0].name  # names show what is varied
+
+
+def test_link_chains_resolve_to_their_root_and_can_read_fixed_values(tmp_path) -> None:
+    spec = {
+        **LINKED,
+        "vary": {"assignment.policy": ["edf", "fcfs"]},
+        "fixed": {"sim.seeds": 2, "demand.actual_growth": 3.0},
+        "link": {
+            "capacity_plan.assumed_growth": "demand.actual_growth",
+            "demand.history_growth_per_year": "automation.desk_reduction",
+            "automation.desk_reduction": "demand.live_view_share",
+        },
+    }
+    for r in sweep.expand(sweep.load_sweep(_write(tmp_path, spec))):
+        assert r.params.capacity_plan.assumed_growth == 3.0
+        share = r.params.demand.live_view_share
+        assert r.params.automation.desk_reduction == share
+        assert r.params.demand.history_growth_per_year == share
+
+
+@pytest.mark.parametrize(
+    ("link", "message"),
+    [
+        ({"capacity_plan.assumed_growth": "demand.actual_grwth"}, "not a parameter"),
+        ({"capacity_plan.assumed_grwth": "demand.actual_growth"}, "not a parameter"),
+        ({"assignment.weights": "demand.actual_growth"}, "not a parameter"),  # a group
+        ({"demand.actual_growth": "demand.actual_growth"}, "itself"),
+        ({"demand.actual_growth": "sim.seed"}, "also varied"),
+        ({"sim.seeds": "sim.seed"}, "also fixed"),
+        (
+            {
+                "capacity_plan.quantile": "capacity_plan.target_utilisation",
+                "capacity_plan.target_utilisation": "capacity_plan.quantile",
+            },
+            "cycle",
+        ),  # fmt: skip
+        (["capacity_plan.assumed_growth"], "must map"),
+    ],
+)
+def test_bad_links_are_rejected(link, message) -> None:
+    with pytest.raises(ValueError, match=message):
+        sweep.parse_sweep({**LINKED, "link": link})
+
+
+def test_linked_value_still_goes_through_validation(tmp_path) -> None:
+    # sim.seeds (int, 1..5) <- demand.actual_growth (float): strict validation refuses it.
+    spec = {**LINKED, "fixed": {}, "link": {"sim.seeds": "demand.actual_growth"}}
+    with pytest.raises(ValueError):
+        sweep.expand(sweep.load_sweep(_write(tmp_path, spec)))
+
+
+# --- published columns: named + everything that differs from the defaults ------------------
+
+
+def _publish(tmp_path: Path, spec: dict, base: Path | None = None) -> pd.DataFrame:
+    root = tmp_path / "runs"
+    path = _write(tmp_path, {**spec, **({"base": str(base)} if base else {})})
+    parsed = sweep.load_sweep(path)
+    sweep_id, run_ids = sweep.queue_sweep(parsed, root)
+    for k, run_id in enumerate(run_ids):
+        _finish(run_id, root, 0.9 + 0.01 * k)
+    return pd.read_parquet(sweep.publish(parsed, sweep_id, root, out_dir=tmp_path / "pub"))
+
+
+def test_published_table_has_linked_columns(tmp_path) -> None:
+    df = _publish(tmp_path, LINKED)
+    assert "capacity_plan.assumed_growth" in df.columns
+    assert (df["capacity_plan.assumed_growth"] == df["demand.actual_growth"]).all()
+
+
+def test_published_table_adds_every_parameter_changed_by_a_custom_base(tmp_path) -> None:
+    from scout_planner.config import apply_overrides, dump_params
+
+    base = tmp_path / "base.yaml"
+    custom = apply_overrides(
+        load_default_params(),
+        {"team.full_time_count": 10, "demand.desk_hours": [3.0, 9.0],
+         "assignment.weights": {"churn": 7.0}},
+    )  # fmt: skip
+    dump_params(custom, base)
+    df = _publish(tmp_path, {**SPEC, "vary": {"assignment.policy": ["edf", "fcfs"]}}, base)
+    assert set(df["team.full_time_count"]) == {10}
+    assert set(df["assignment.weights.churn"]) == {7.0}
+    assert [list(v) for v in df["demand.desk_hours"]] == [[3.0, 9.0]] * 2
+    # parameters left at their defaults are not published
+    assert "team.freelance_count" not in df.columns and "assignment.weights.cost" not in df.columns
+    assert sweep.differing_leaves(load_default_params()) == {}
+
+
+def test_published_rows_with_a_null_parameter_rebuild_exactly(tmp_path) -> None:
+    from scout_planner.results import normalise_sweep_frame, params_for_sweep_row
+
+    spec = {**SPEC, "vary": {"assignment.commit_buffer_days": [None, 2]}, "fixed": {}}
+    path = _write(tmp_path, spec)
+    df = _publish(tmp_path, spec)
+    root = tmp_path / "runs"
+    for row in normalise_sweep_frame(df, load_default_params()).to_dict("records"):
+        rebuilt = params_for_sweep_row(row, load_default_params(), path)
+        assert rebuilt == runs.read_params(row["run_id"], root)
+
+
+def test_publish_is_atomic_and_leaves_no_temp_files(tmp_path, monkeypatch) -> None:
+    root, out = tmp_path / "runs", tmp_path / "pub"
+    spec = sweep.load_sweep(_write(tmp_path, SPEC))
+    sweep_id, run_ids = sweep.queue_sweep(spec, root)
+    for run_id in run_ids:
+        _finish(run_id, root, 0.9)
+    first = sweep.publish(spec, sweep_id, root, out_dir=out)
+    before = first.read_bytes()
+
+    def broken(self, path, **kwargs):
+        Path(path).write_bytes(b"half a file")
+        raise OSError("disk full")
+
+    monkeypatch.setattr(pd.DataFrame, "to_parquet", broken)
+    with pytest.raises(OSError, match="disk full"):
+        sweep.publish(spec, sweep_id, root, out_dir=out)
+    assert first.read_bytes() == before  # the old file is untouched
+    assert [p.name for p in out.iterdir()] == [first.name]  # temp file cleaned up
+
+
+@pytest.mark.slow
+def test_sweeps_run_concurrently_into_different_roots_and_publish_together(tmp_path) -> None:
+    """Two CLI sweeps at once, separate --root folders, one shared published folder."""
+    import subprocess
+    import sys
+
+    fixed = {
+        "sim.months": 1, "sim.seeds": 1, "team.full_time_count": 8, "team.freelance_count": 4,
+        "demand.start_load": 0.3, "team.follow_hiring_plan": False,
+    }  # fmt: skip
+    published = tmp_path / "published"
+    procs = []
+    for name in ("left", "right"):
+        spec = {"name": name, "vary": {"assignment.policy": ["fcfs", "edf"]}, "fixed": fixed}
+        argv = [
+            sys.executable, "-m", "scout_planner.cli", "sweep",
+            "--sweep", str(_write(tmp_path, spec, f"{name}.yaml")),
+            "--root", str(tmp_path / f"runs-{name}"), "--workers", "1",
+            "--publish", "--published-dir", str(published),
+        ]  # fmt: skip
+        procs.append(subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT))
+    for proc in procs:
+        out, _ = proc.communicate(timeout=300)
+        assert proc.returncode == 0, out.decode()
+    assert sorted(p.name for p in published.iterdir()) == [
+        "left_summary.parquet",
+        "right_summary.parquet",
+    ]
+    for name in ("left", "right"):
+        assert len(pd.read_parquet(published / f"{name}_summary.parquet")) == 2

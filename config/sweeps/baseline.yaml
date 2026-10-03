@@ -1,0 +1,13 @@
+# The do-nothing baseline: 4x growth arrives and nobody is hired (the hiring
+# plan is ignored). How far do assignment policy and the pre-screen tool get
+# the current team on their own? 3 x 2 = 6 runs x 3 seeds.
+name: baseline
+base: config/default.yaml
+vary:
+  assignment.policy: [fcfs, edf, optimiser]
+  automation.enabled: [false, true]
+fixed:
+  demand.actual_growth: 4.0
+  team.follow_hiring_plan: false
+  sim.seeds: 3
+  assignment.time_limit_s: 1.0  # at 0.3 s, 44% of solves fell back to EDF on this huge backlog

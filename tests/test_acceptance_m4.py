@@ -405,15 +405,6 @@ def test_published_rows_rebuild_queued_parameters_including_nested_fixed_values(
         )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "GAP sweep.publish / results.params_for_sweep_row: a sweep whose `base` is not "
-        "config/default.yaml publishes only varied/fixed/always columns, and the rebuild "
-        "starts from the defaults, so 'Clone settings' silently drops the base's changes "
-        "(DATA_CONTRACTS section 6 promises an exact rebuild)"
-    ),
-)
 def test_published_rows_rebuild_parameters_of_a_sweep_with_a_custom_base(tmp_path: Path) -> None:
     root = tmp_path / "runs"
     base_file = tmp_path / "small_team.yaml"

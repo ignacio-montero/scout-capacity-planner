@@ -376,10 +376,16 @@ def flatten_params(params: Params | Mapping[str, Any], prefix: str = "") -> dict
 
 def _python_value(value: Any) -> Any:
     """numpy values (from a parquet row) -> plain Python; lists become range tuples."""
+    if value is None or value is pd.NA:
+        return None
     if hasattr(value, "tolist"):  # numpy scalar or array
         value = value.tolist()
     if isinstance(value, list):
         return tuple(value)
+    # Parquet stores a missing value in a numeric column as NaN; a null parameter
+    # (e.g. commit_buffer_days: null) must come back as None, not float("nan").
+    if isinstance(value, float) and math.isnan(value):
+        return None
     return value
 
 

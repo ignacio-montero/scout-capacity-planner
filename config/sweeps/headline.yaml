@@ -1,12 +1,20 @@
-# The README answer (first cut; contents still open, NEXT_STEPS Q6): which mix
-# of assignment policy, hiring and automation keeps >= 95% on time at the
-# lowest cost as demand grows? 3 x 3 x 2 x 2 = 36 runs x 5 seeds.
+# The README answer: demand grows 4x this year and the agency plans for it
+# (assumed growth = actual). Which combination of assignment policy, hiring
+# mix (the plan's full-time/freelance rule, freelancers only, full-timers
+# only), planning caution (P50 / P80 / P90 forecast) and the pre-screen tool
+# keeps >= 95% of reports within 14 days at the lowest total cost?
+# 3 x 3 x 3 x 2 = 54 runs x 3 seeds. Each run is one dot on the
+# on-time vs cost chart; the cheapest dot above the 95% line is the answer.
 name: headline
 base: config/default.yaml
 vary:
   assignment.policy: [fcfs, edf, optimiser]
-  demand.actual_growth: [1.0, 2.0, 4.0]
+  capacity_plan.hire_mix: [rule, freelance_only, full_time_only]
+  capacity_plan.quantile: [0.5, 0.8, 0.9]
   automation.enabled: [false, true]
-  team.follow_hiring_plan: [false, true]
 fixed:
-  sim.seeds: 5
+  demand.actual_growth: 4.0
+  sim.seeds: 3
+  assignment.time_limit_s: 0.3
+link:
+  capacity_plan.assumed_growth: demand.actual_growth
