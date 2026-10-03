@@ -128,7 +128,8 @@ ShouldCancel = Callable[[], bool]
 class SimInputs:
     """Everything one replication needs, as domain objects. Built by :func:`prepare_replication`.
 
-    ``scouts`` holds the initial team plus any hires (``joined_month > 0``);
+    ``scouts`` holds the initial team plus any hires (ids ``H###``; they may join
+    in month 0 when the lead time is 0);
     ``weekly_hours`` maps ``(scout_id, week_start)`` to offered hours;
     ``requests`` are the simulated period's requests only.
     """

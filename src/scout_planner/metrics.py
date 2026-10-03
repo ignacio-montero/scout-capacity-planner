@@ -183,7 +183,9 @@ def seed_row(result: ReplicationResult, params: Params) -> dict[str, Any]:
     for kind in ("full_time", "freelance"):
         rows = sc[sc["employment"] == kind]
         util[kind] = _ratio(rows["hours_worked"].sum(), rows["hours_offered"].sum())
-    hires = sc[sc["joined_month"] > 0]
+    # Hires are identified by id (H###), not join month: with a zero lead time a
+    # hire can join in month 0, alongside the initial team.
+    hires = sc[sc["scout_id"].astype(str).str.startswith("H")]
     d = result.diagnostics
     solves = d.get("optimiser_solves", 0)
     row: dict[str, Any] = {

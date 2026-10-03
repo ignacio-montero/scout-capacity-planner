@@ -7,7 +7,7 @@ PARAMS ?= config/default.yaml
 SWEEP ?= quick
 SWEEP_ARGS ?=
 
-.PHONY: setup test lint format \
+.PHONY: setup test test-all lint format \
         data forecast plan simulate run sweep app charts all
 
 # Placeholder recipe: print a message and fail. $(1) = milestone that implements it.
@@ -19,7 +19,10 @@ setup:  ## install the locked environment and enable the repo's git hooks
 	uv sync --locked
 	git config core.hooksPath .githooks
 
-test:  ## run the test suite (includes the guardrail check)
+test:  ## fast test suite (skips tests marked slow; includes the guardrail check)
+	uv run pytest -m "not slow"
+
+test-all:  ## full test suite including slow end-to-end tests (~7 min)
 	uv run pytest
 
 lint:  ## static checks; fails if code is not formatted
