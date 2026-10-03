@@ -3,6 +3,8 @@
 # fail at load time. A test asserts this file equals the code defaults.
 # [a, b] pairs are [min, max] ranges.
 
+schema_version: 1              # parameter-file layout; bumped with a migration in config.py
+
 team:                          # initial team
   full_time_count: 24
   freelance_count: 16
@@ -44,7 +46,7 @@ assignment:                    # daily who-does-which-work decision (D-010, D-01
   unit: task                   # task | bundle
   horizon_days: 7              # rolling window each assignment run looks ahead
   weights:                     # optimiser objective
-    lateness: 100.0
+    lateness: 1.0              # multiplier on cost.late_penalty for unassigned urgent work
     cost: 1.0
     continuity: 5.0
     churn: 3.0

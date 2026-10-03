@@ -8,12 +8,14 @@ the optimiser (see ``optimiser.py``).
 
 Rules shared by both (D-010):
 
-1. **Commitments first, never moved.** Items that already have a
+1. **Commitments first, never moved by choice.** Items that already have a
    ``current_scout_id`` (assigned in an earlier run, not started) are placed
-   first, in policy order, with that same scout. If the scout can no longer
-   take one (e.g. their window shrank), the item is left unassigned this run
-   rather than moved; it returns to the open pool for the next run.
-2. **Then the open items**, in policy order. Among the scouts that may take
+   first, in policy order, with that same scout.
+2. **Forced moves are not churn.** If the current scout can no longer take a
+   committed item (away on the fixture day, no longer eligible, hours gone, or
+   no longer on the team), the commitment is void and the item is re-placed
+   in step 3 like a new item. Leaving it stranded would only make it late.
+3. **Then the open items**, in policy order. Among the scouts that may take
    the item (``eligibility.py``) and still have the hours, pick by:
 
    a. salaried before freelance: salaried hours are already paid for, a
@@ -25,11 +27,14 @@ Rules shared by both (D-010):
    Rejected: "first eligible scout in list order" (the brief's wording). It is
    even simpler, but it makes results depend on how the team list happens to
    be sorted and piles work on low-numbered scouts. The rule above is still
-   naive on purpose: it ignores that a multi-skilled scout is scarce, which is
-   exactly the mistake the optimiser exists to avoid.
+   naive on purpose: it ignores that a multi-skilled scout is scarce, and it
+   only checks the scout's *window total*, not whether each item can be
+   finished by its due date (``eligibility.due_date_violations``). Those are
+   exactly the mistakes the optimiser exists to avoid.
 
-Greedy policies use no randomness; ``rng`` is accepted only to satisfy the
-common interface.
+Greedy policies use no randomness and no cost figures; ``rng`` and ``cost``
+are accepted only to satisfy the common interface. Inputs are sorted by id on
+entry, so the answer does not depend on the order of the lists passed in.
 """
 
 from __future__ import annotations
@@ -39,8 +44,8 @@ from collections.abc import Callable, Sequence
 
 import numpy as np
 
-from scout_planner.assign.eligibility import check_unique_ids, fits, is_eligible, planned_date
-from scout_planner.config import AssignmentParams
+from scout_planner.assign.eligibility import check_inputs, fits, is_eligible, planned_date
+from scout_planner.config import AssignmentParams, CostParams
 from scout_planner.domain import Assignment, AssignmentWindow, ScoutState, WorkItem
 
 OrderKey = Callable[[WorkItem], tuple]
@@ -63,11 +68,13 @@ def greedy_assign(
     order_key: OrderKey,
 ) -> list[Assignment]:
     """List scheduling with the rules in the module docstring, for any priority order."""
-    check_unique_ids(pool, scouts)
+    check_inputs(pool, scouts, window)
+    scouts = sorted(scouts, key=lambda s: s.scout_id)
     states = {s.scout_id: s for s in scouts}
     remaining = {s.scout_id: s.free_hours for s in scouts}
     live_days: dict[str, set[dt.date]] = {s.scout_id: set() for s in scouts}
     chosen: list[Assignment] = []
+    placed: set[str] = set()
 
     def can_take(item: WorkItem, state: ScoutState) -> bool:
         sid = state.scout_id
@@ -83,23 +90,22 @@ def greedy_assign(
         if item.fixed_date is not None:
             live_days[sid].add(item.fixed_date)
         chosen.append(Assignment(item.item_id, sid, planned_date(item)))
+        placed.add(item.item_id)
 
     def preference(state: ScoutState) -> tuple[bool, float, str]:
         return (state.scout.is_freelance, -remaining[state.scout_id], state.scout_id)
 
     ordered = sorted(pool, key=order_key)
 
-    # 1. Commitments: keep the current scout or leave unassigned. Never move.
+    # 1. Commitments: keep the current scout when that is still possible.
     for item in ordered:
-        if item.current_scout_id is None:
-            continue
-        state = states.get(item.current_scout_id)
+        state = states.get(item.current_scout_id) if item.current_scout_id else None
         if state is not None and can_take(item, state):
             take(item, state)
 
-    # 2. Open items: best scout by the documented preference.
+    # 2-3. Open items and voided commitments: best scout by the documented preference.
     for item in ordered:
-        if item.current_scout_id is not None:
+        if item.item_id in placed:
             continue
         candidates = [s for s in scouts if can_take(item, s)]
         if candidates:
@@ -114,6 +120,8 @@ def fcfs(
     window: AssignmentWindow,
     cfg: AssignmentParams,
     rng: np.random.Generator,
+    *,
+    cost: CostParams,
 ) -> list[Assignment]:
     """First come, first served: work through items by ``received_date``."""
     return greedy_assign(pool, scouts, window, fcfs_key)
@@ -125,6 +133,8 @@ def edf(
     window: AssignmentWindow,
     cfg: AssignmentParams,
     rng: np.random.Generator,
+    *,
+    cost: CostParams,
 ) -> list[Assignment]:
     """Earliest due date first: work through items by ``due_date``."""
     return greedy_assign(pool, scouts, window, edf_key)

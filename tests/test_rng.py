@@ -76,3 +76,38 @@ def test_duplicate_names_are_rejected() -> None:
 def test_invalid_seed_or_name_is_rejected(seed: int, name: str) -> None:
     with pytest.raises(ValueError):
         make_stream(seed, name)
+
+
+# --- replications (N3) -------------------------------------------------------------
+
+
+def test_replication_zero_is_backward_compatible() -> None:
+    """Pinned raw output: generated worlds committed before replications existed
+    must not change. If this fails, every seed-0 world changed."""
+    assert make_stream(42, "arrivals").bit_generator.random_raw() == 15175625775097614054
+    assert draws(make_stream(42, "arrivals", replication=0)) == draws(make_stream(42, "arrivals"))
+
+
+def test_replications_differ_from_each_other() -> None:
+    reps = [draws(make_stream(42, "arrivals", replication=k)) for k in range(5)]
+    assert len({tuple(r) for r in reps}) == 5
+
+
+def test_replications_never_coincide_with_a_neighbouring_seed() -> None:
+    """The bug ``seed + k`` would have: rep 1 of seed 42 == rep 0 of seed 43."""
+    worlds = {
+        (seed, k): tuple(draws(make_stream(seed, "arrivals", replication=k)))
+        for seed in range(40, 46)
+        for k in range(4)
+    }
+    assert len(set(worlds.values())) == len(worlds)
+
+
+def test_make_streams_passes_replication_through() -> None:
+    streams = make_streams(42, ["arrivals", "rework"], replication=2)
+    assert draws(streams["rework"]) == draws(make_stream(42, "rework", replication=2))
+
+
+def test_negative_replication_is_rejected() -> None:
+    with pytest.raises(ValueError, match="replication"):
+        make_stream(42, "arrivals", replication=-1)

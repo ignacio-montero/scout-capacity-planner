@@ -12,8 +12,11 @@ import datetime as dt
 import pytest
 
 from scout_planner.assign.eligibility import (
-    check_unique_ids,
+    check_inputs,
+    deadline_index,
+    due_date_violations,
     eligible_scouts,
+    free_by_day,
     ineligibility_reasons,
     is_eligible,
     validate_assignments,
@@ -48,7 +51,9 @@ def make_state(
     unavailable: tuple[dt.date, ...] = (),
 ) -> ScoutState:
     scout = Scout(sid, f"Scout {sid}", "full_time", skills, region, 37.5, 37.5, former, 4500.0)
-    hours = {d: (weekday_hours if d.weekday() < 5 else 0.0) for d in WINDOW.days}
+    hours = {
+        d: (weekday_hours if d.weekday() < 5 and d not in unavailable else 0.0) for d in WINDOW.days
+    }
     return ScoutState(scout, hours, frozen, unavailable)
 
 
@@ -61,6 +66,7 @@ def make_item(
     region: str = "North",
     clubs: tuple[str, ...] = ("Rio Claro FC",),
     depends_on: tuple[str, ...] = (),
+    due: dt.date | None = None,
 ) -> WorkItem:
     live = live_on is not None
     return WorkItem(
@@ -71,7 +77,7 @@ def make_item(
         hours=8.0 if live else hours,
         skill_type=skill,
         received_date=D0,
-        due_date=day(10),
+        due_date=due or day(10),
         conflict_clubs=clubs,
         fixed_date=live_on,
         region=region if live else None,
@@ -122,11 +128,19 @@ def test_eligible_scouts_also_requires_the_item_to_fit_alone() -> None:
     assert [s.scout_id for s in result["T00001-desk"]] == ["S002"]
 
 
-def test_duplicate_ids_fail_loudly() -> None:
+def test_malformed_inputs_fail_loudly() -> None:
     with pytest.raises(ValueError, match="duplicate work item"):
-        check_unique_ids([make_item(), make_item()], [make_state()])
+        check_inputs([make_item(), make_item()], [make_state()], WINDOW)
     with pytest.raises(ValueError, match="duplicate scout"):
-        check_unique_ids([make_item()], [make_state(), make_state()])
+        check_inputs([make_item()], [make_state(), make_state()], WINDOW)
+    state = make_state()
+    beyond = ScoutState(state.scout, {**state.hours_by_day, day(7): 7.5})
+    with pytest.raises(ValueError, match="outside the window"):
+        check_inputs([], [beyond], WINDOW)
+    on_leave = ScoutState(state.scout, state.hours_by_day, unavailable_dates={D0})
+    with pytest.raises(ValueError, match="leave days"):
+        check_inputs([], [on_leave], WINDOW)
+    check_inputs([make_item()], [make_state(unavailable=(D0,))], WINDOW)  # 0 h on leave: fine
 
 
 # --- the validator ----------------------------------------------------------------------
@@ -222,3 +236,43 @@ def test_work_item_carries_scouts_already_on_the_request() -> None:
     )
     assert item.request_scout_ids == frozenset({"S001"})
     assert WorkItem.bundle(desk, writeup, request).request_scout_ids == frozenset()
+
+
+# --- due-date feasibility (EDF condition for one scout) --------------------------------
+
+
+def test_free_by_day_is_cumulative_after_frozen_work() -> None:
+    free = free_by_day(make_state(frozen=10.0), WINDOW)
+    assert free == [0, 500, 1250, 2000, 2750, 2750, 2750]  # hundredths of an hour
+
+
+def test_deadline_is_the_due_day_or_the_first_day_the_item_could_be_done() -> None:
+    free = free_by_day(make_state(), WINDOW)  # 7.5 h a day, nothing frozen
+    assert deadline_index(make_item(hours=4.0, due=day(2)), free, WINDOW) == 2
+    assert deadline_index(make_item(hours=4.0, due=day(30)), free, WINDOW) == 6  # clamped
+    assert deadline_index(make_item(hours=10.0, due=D0), free, WINDOW) == 1  # can't be on time
+    assert deadline_index(make_item(hours=4.0, due=day(-3)), free, WINDOW) == 0  # overdue
+    assert deadline_index(make_item("T00001-live", live_on=day(3)), free, WINDOW) == 3
+    assert deadline_index(make_item(hours=40.0), free, WINDOW) is None
+
+
+def test_due_date_violations_catch_work_that_fits_the_week_but_not_the_day() -> None:
+    pool = [
+        make_item("T00001-desk", hours=5.0, due=D0),
+        make_item("T00002-desk", hours=5.0, due=D0),
+    ]
+    both = [Assignment("T00001-desk", "S001"), Assignment("T00002-desk", "S001")]
+    assert validate_assignments(pool, [make_state()], WINDOW, both) == []  # window total is fine
+    problems = due_date_violations(pool, [make_state()], WINDOW, both)
+    assert len(problems) == 1 and "due-date capacity" in problems[0]
+    assert validate_assignments(pool, [make_state()], WINDOW, both, check_due_dates=True)
+    assert due_date_violations(pool, [make_state()], WINDOW, both[:1]) == []
+
+
+def test_due_date_check_counts_frozen_work_first() -> None:
+    pool = [make_item(hours=4.0, due=day(1))]
+    answer = [Assignment("T00001-desk", "S001")]
+    assert due_date_violations(pool, [make_state(frozen=11.0)], WINDOW, answer) == []
+    # 12 h frozen + 4 h due by Tuesday > 15 h by Tuesday: the deadline moves to
+    # Wednesday (first day it could be done), so the item is late but still legal.
+    assert due_date_violations(pool, [make_state(frozen=12.0)], WINDOW, answer) == []

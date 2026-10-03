@@ -13,30 +13,38 @@ Decision variables
 
 Hard constraints
     * each item goes to at most one scout (unassigned items roll over);
-    * each scout's assigned hours <= free hours in the window (window hours
-      minus frozen work: started work is counted first, D-010);
+    * **due-date capacity** per scout and window day ``d``: frozen hours +
+      hours of assigned items due by ``d`` <= hours offered up to ``d``. This
+      is the condition under which one scout working their queue
+      earliest-due-first finishes everything on time (see
+      ``eligibility.py``). Its last day is the plain window-total cap. Without
+      the per-day part, the model believed 10 h due tomorrow fit in a 37.5 h
+      week and counted it as on time;
     * at most one live view per scout per date (a live view takes the day, D-008).
 
-Objective (minimise; weights are ``assignment.weights``)
-    * **lateness**: for each item left unassigned, ``lateness x urgency``.
-      See :func:`urgency`: it grows as the request's slack shrinks, and
-      overdue requests are the most urgent of all.
-    * **cost**: ``cost x freelance hours x the freelancer's hourly rate``.
-      Salaried hours cost 0 here: salaries are paid whether the scout is busy
-      or not (a *sunk cost*), so only freelance hours change the bill.
-    * **continuity**: ``continuity`` per extra scout on one request (a desk
-      review and a write-up by different scouts means a hand-over). Scouts
-      already on the request outside the pool come in through
+Objective (minimise, in cost units)
+    * **lateness**: ``cost.late_penalty x weights.lateness x urgency`` per
+      *request* left (partly) unassigned, shared across the request's pool
+      items by hours. One late request costs about one late penalty however
+      many tasks it has. See :func:`urgency` and :func:`lateness_penalties`.
+    * **cost**: ``weights.cost x freelance hours x the freelancer's hourly
+      rate``. Salaried hours cost 0 here: salaries are paid whether the scout
+      is busy or not (a *sunk cost*), so only freelance hours change the bill.
+    * **continuity**: ``weights.continuity`` per extra scout on one request (a
+      desk review and a write-up by different scouts means a hand-over).
+      Scouts already on the request outside the pool come in through
       ``WorkItem.request_scout_ids``.
-    * **churn**: ``churn`` per item taken away from its ``current_scout_id``
-      (assigned earlier, not started), whether moved to another scout or
-      dropped back to the pool. Without the "dropped" half, un-assigning would
-      be a free way round the penalty. Changing the plan is allowed, but must
-      pay for itself (*plan nervousness* control, D-010).
+    * **churn**: ``weights.churn`` per item taken away from its
+      ``current_scout_id`` (assigned earlier, not started), whether moved to
+      another scout or dropped back to the pool. Without the "dropped" half,
+      un-assigning would be a free way round the penalty. Changing the plan is
+      allowed, but must pay for itself (*plan nervousness* control, D-010).
+      A move *forced* by the current scout no longer being able to take the
+      item pays nothing extra (every option costs the same).
 
-Hours are scaled to integers (CP-SAT only handles integers): item hours are
-rounded *up* and capacities *down* to 1/100 h, so every solution is also valid
-in exact float arithmetic.
+Hours are integers in hundredths of an hour (``eligibility.HOURS_SCALE``),
+work rounded up and capacity down, so every solution is also valid in exact
+float arithmetic and passes ``validate_assignments(check_due_dates=True)``.
 
 Determinism vs wall-clock time
     Same inputs + same ``rng`` state must give the same assignments, or two
@@ -51,20 +59,27 @@ Determinism vs wall-clock time
       counter, which is the same on every machine. One unit is roughly one
       second on a laptop, not exactly (measured in M3: 1.0 unit = ~0.8 s on
       the dev machine for 400 items x 60 scouts);
-    * ``max_time_in_seconds = WALL_CLOCK_SAFETY x time_limit_s`` as a backstop
-      for very slow machines. If that cap ever fires, that solve stops being
-      reproducible; the trade-off is a guaranteed bound on run time.
+    * ``max_time_in_seconds = max(10 x limit, limit + 5 s)`` as a backstop for
+      a machine that is very slow or overloaded. It is set far above the
+      deterministic limit so it practically never fires; if it does, that
+      solve is no longer reproducible and ``SolveReport.hit_wall_clock`` says
+      so, so a run can count and report it.
+
+    Inputs are also sorted by id on entry, so the model (and the answer) does
+    not depend on the order of the lists passed in.
 
     Rejected: wall-clock limit only (simple, but not reproducible); several
     workers (faster on big models, not reproducible); no limit at all (proves
     optimality on small days but can stall a whole simulated year on a busy one).
 
-Warm start: the EDF answer is passed as a complete, feasible *solution hint*
-(continuity helpers included), so the solver has a first solution almost at
-once and only searches for improvements. Measured: with a partial hint, a
-0.1 s budget on 400 items ended with no solution at all. If the solver is
-still empty-handed when stopped (status ``UNKNOWN``), the policy falls back to
-EDF and logs a warning.
+Warm start: the EDF answer, trimmed to what the model allows, is passed as a
+complete, feasible *solution hint* (continuity helpers included), so the
+solver has a first solution almost at once and only searches for
+improvements. Measured: with a partial hint, a 0.1 s budget on 400 items ended
+with no solution at all. If the solver is still empty-handed when stopped
+(status ``UNKNOWN``), the policy falls back to EDF and logs a warning.
+``INFEASIBLE`` or ``MODEL_INVALID`` raise: assigning nothing is always
+feasible, so either one means a bug in the model.
 """
 
 from __future__ import annotations
@@ -79,23 +94,37 @@ from dataclasses import dataclass
 import numpy as np
 from ortools.sat.python import cp_model
 
-from scout_planner.assign.eligibility import check_unique_ids, eligible_scouts, planned_date
+from scout_planner.assign.eligibility import (
+    check_inputs,
+    deadline_index,
+    eligible_scouts,
+    free_by_day,
+    planned_date,
+    scaled_hours,
+)
 from scout_planner.assign.greedy import edf
-from scout_planner.config import FULL_TIME_WEEKLY_HOURS, AssignmentParams
+from scout_planner.config import FULL_TIME_WEEKLY_HOURS, AssignmentParams, CostParams
 from scout_planner.domain import Assignment, AssignmentWindow, Scout, ScoutState, WorkItem
 
 log = logging.getLogger(__name__)
 
-HOURS_SCALE = 100  # hours -> integer hundredths of an hour
 OBJECTIVE_SCALE = 100  # objective terms -> integers, keeping two decimals
-WALL_CLOCK_SAFETY = 2.0  # wall-clock cap = this x time_limit_s
+WALL_CLOCK_FACTOR = 10.0  # backstop: max(factor x limit, limit + extra)
+WALL_CLOCK_MIN_EXTRA_S = 5.0
 
 DAY_HOURS = FULL_TIME_WEEKLY_HOURS / 5  # 7.5 h: one working day, for slack in days
-URGENCY_MAX = 10.0  # zero slack: lateness weight 100 x 10 = 1000 ~ cost.late_penalty
-URGENCY_OVERDUE = 2 * URGENCY_MAX  # already past due: the most urgent of all
+URGENCY_ZERO_SLACK = 1.0  # last chance to be on time: one full late penalty
+URGENCY_OVERDUE = 1.25  # already late: ranked above any still-savable request
+URGENCY_LOST_FIXTURE = URGENCY_OVERDUE  # a live view whose match is gone after this run
+RUN_INTERVAL_DAYS = {"daily": 1, "weekly": 7}  # days until the next assignment run
 
 
-# --- urgency -----------------------------------------------------------------------
+def wall_clock_cap(time_limit_s: float) -> float:
+    """The wall-clock backstop for one solve, in seconds."""
+    return max(WALL_CLOCK_FACTOR * time_limit_s, time_limit_s + WALL_CLOCK_MIN_EXTRA_S)
+
+
+# --- lateness -------------------------------------------------------------------------
 
 
 def remaining_work_days(items: Sequence[WorkItem], today: dt.date) -> int:
@@ -128,27 +157,55 @@ def slack_days(due_date: dt.date, today: dt.date, work_days: int) -> int:
 
 
 def urgency(slack: int, *, overdue: bool) -> float:
-    """How bad it is to leave an item unassigned today, on a 0..20 scale.
+    """Share of a late penalty at stake if the request waits: 0 < urgency <= 1.25.
 
-    ``URGENCY_MAX / (1 + slack)`` for slack >= 0: 10 at zero slack, 5 with one
-    day to spare, 1 with nine. A hyperbola rather than a straight line because
-    a day of slack matters much more when there are two left than when there
-    are twelve. Negative slack (can no longer make it) counts as zero slack.
-    Overdue requests get twice the maximum, so they are never starved by a
-    stream of new zero-slack work (that would make turnaround tails explode).
+    ``1 / (1 + slack)`` for slack >= 0: 1.0 at zero slack (the last chance to
+    be on time is now), 0.5 with one day to spare, 0.1 with nine. A hyperbola
+    rather than a straight line because a day of slack matters much more when
+    there are two left than when there are twelve. Negative slack (can no
+    longer make it) counts as zero slack.
 
-    Calibration: at the default lateness weight (100), a zero-slack item is
-    worth 1000, the default late penalty per report. So with default weights
-    a freelancer at ~41.5/h is hired for a 6 h desk review (~250) once slack
-    is down to about 3 days, and for urgent work always.
+    Overdue requests get 1.25: above any request that can still be saved, so
+    old work is not pushed back indefinitely by a stream of new urgent work.
+    This lowers the risk of starvation; it does not rule it out (a large
+    overdue item can still lose to several small urgent ones competing for
+    the same hours, or to a freelancer's cost).
     """
     if overdue:
         return URGENCY_OVERDUE
-    return URGENCY_MAX / (1 + max(slack, 0))
+    return URGENCY_ZERO_SLACK / (1 + max(slack, 0))
 
 
-def item_urgencies(pool: Sequence[WorkItem], today: dt.date) -> dict[str, float]:
-    """Urgency per item id; every item of a request shares the request's urgency."""
+def next_run_date(window: AssignmentWindow, cfg: AssignmentParams) -> dt.date:
+    """When the next assignment run happens, derived from ``assignment.cadence``."""
+    return window.start + dt.timedelta(days=RUN_INTERVAL_DAYS[cfg.cadence])
+
+
+def is_perishable(item: WorkItem, next_run: dt.date) -> bool:
+    """A live view whose fixture is before the next run: assign it now or lose the match."""
+    return item.fixed_date is not None and item.fixed_date < next_run
+
+
+def lateness_penalties(
+    pool: Sequence[WorkItem],
+    today: dt.date,
+    next_run: dt.date,
+    late_penalty: float,
+    weight: float,
+) -> dict[str, float]:
+    """Cost units at stake per item if it is left unassigned this run.
+
+    Per request: ``late_penalty x weight x urgency(request)``, shared across
+    the request's pool items in proportion to their hours. Sharing (rather
+    than charging each item in full) keeps one request worth about one late
+    penalty, so a request with a live view (three tasks) does not count more
+    than one without (two tasks).
+
+    Exception, *perishable* live views (:func:`is_perishable`): leaving one
+    unassigned loses the match, which makes the request late almost surely,
+    so it carries a full ``URGENCY_LOST_FIXTURE`` penalty of its own, whatever
+    the request's slack.
+    """
     by_request: defaultdict[str, list[WorkItem]] = defaultdict(list)
     for item in pool:
         by_request[item.request_id].append(item)
@@ -156,8 +213,13 @@ def item_urgencies(pool: Sequence[WorkItem], today: dt.date) -> dict[str, float]
     for items in by_request.values():
         due = min(i.due_date for i in items)
         slack = slack_days(due, today, remaining_work_days(items, today))
-        u = urgency(slack, overdue=due < today)
-        result.update((i.item_id, u) for i in items)
+        at_stake = late_penalty * weight * urgency(slack, overdue=due < today)
+        total_hours = sum(i.hours for i in items)
+        for i in items:
+            if is_perishable(i, next_run):
+                result[i.item_id] = late_penalty * weight * URGENCY_LOST_FIXTURE
+            else:
+                result[i.item_id] = at_stake * i.hours / total_hours
     return result
 
 
@@ -175,14 +237,23 @@ def hourly_cost(scout: Scout) -> float:
 
 @dataclass(frozen=True, slots=True)
 class SolveReport:
-    """What one optimiser call did. ``assignments`` is the policy's answer."""
+    """What one optimiser call did. ``assignments`` is the policy's answer.
+
+    ``objective`` and ``best_bound`` are in cost units; ``gap`` is
+    ``(objective - best_bound) / max(1, |objective|)``: 0 means proven optimal.
+    A simulation should count ``hit_wall_clock`` (that solve was not
+    reproducible) and ``fell_back_to_edf`` per run.
+    """
 
     assignments: list[Assignment]
     status: str  # CP-SAT status name, or "EMPTY" when there was nothing to decide
-    objective: float | None  # in objective units (already divided by OBJECTIVE_SCALE)
+    objective: float | None
+    best_bound: float | None
+    gap: float | None
     wall_time_s: float
     deterministic_time: float
     fell_back_to_edf: bool = False
+    hit_wall_clock: bool = False
 
 
 def solve_assignment(
@@ -191,28 +262,33 @@ def solve_assignment(
     window: AssignmentWindow,
     cfg: AssignmentParams,
     rng: np.random.Generator,
+    *,
+    cost: CostParams,
 ) -> SolveReport:
     """Build and solve the CP-SAT model; see the module docstring for the model."""
     # Always exactly one draw per call, so the stream advances the same way
     # whether or not there is anything to solve today.
     seed = int(rng.integers(0, 2**31 - 1))
-    check_unique_ids(pool, scouts)
-    candidates = eligible_scouts(pool, scouts, window)
-    if not any(candidates.values()):
-        return SolveReport([], "EMPTY", None, 0.0, 0.0)
+    check_inputs(pool, scouts, window)
+    scouts = sorted(scouts, key=lambda s: s.scout_id)
+    pool = sorted(pool, key=lambda i: i.item_id)
+
+    items = {i.item_id: i for i in pool}
+    states = {s.scout_id: s for s in scouts}
+    free = {s.scout_id: free_by_day(s, window) for s in scouts}
+    units = {i.item_id: scaled_hours(i.hours) for i in pool}
+    deadline: dict[tuple[str, str], int] = {}
+    for item_id, allowed in eligible_scouts(pool, scouts, window).items():
+        for state in allowed:
+            j = deadline_index(items[item_id], free[state.scout_id], window)
+            if j is not None:
+                deadline[item_id, state.scout_id] = j
+    if not deadline:
+        return SolveReport([], "EMPTY", None, None, None, 0.0, 0.0)
 
     w = cfg.weights
-    states = {s.scout_id: s for s in scouts}
-    items = {i.item_id: i for i in pool}
-    urg = item_urgencies(pool, window.start)
     model = cp_model.CpModel()
-
-    # Decision variables, eligible pairs only. Sorted ids -> same model every time.
-    x: dict[tuple[str, str], cp_model.IntVar] = {}
-    for item_id in sorted(candidates):
-        for state in candidates[item_id]:
-            x[item_id, state.scout_id] = model.new_bool_var(f"x[{item_id},{state.scout_id}]")
-
+    x = {key: model.new_bool_var(f"x[{key[0]},{key[1]}]") for key in deadline}
     by_item: defaultdict[str, list[str]] = defaultdict(list)
     by_scout: defaultdict[str, list[str]] = defaultdict(list)
     for item_id, scout_id in x:
@@ -222,12 +298,12 @@ def solve_assignment(
     # Hard constraints.
     for item_id, scout_ids in by_item.items():
         model.add_at_most_one(x[item_id, s] for s in scout_ids)
-    capacity = {s: _scaled_capacity(states[s].free_hours) for s in by_scout}
     for scout_id, item_ids in by_scout.items():
-        model.add(
-            sum(_scaled_hours(items[i].hours) * x[i, scout_id] for i in item_ids)
-            <= capacity[scout_id]
-        )
+        # Due-date capacity: only days that are some item's deadline can bind
+        # (free hours never decrease), so one constraint per distinct deadline.
+        for j in sorted({deadline[i, scout_id] for i in item_ids}):
+            due_by_j = [i for i in item_ids if deadline[i, scout_id] <= j]
+            model.add(sum(units[i] * x[i, scout_id] for i in due_by_j) <= free[scout_id][j])
         live_by_date: defaultdict[dt.date, list[str]] = defaultdict(list)
         for i in item_ids:
             if items[i].fixed_date is not None:
@@ -237,24 +313,23 @@ def solve_assignment(
                 model.add_at_most_one(x[i, scout_id] for i in same_day)
 
     # Objective.
+    late = lateness_penalties(
+        pool, window.start, next_run_date(window, cfg), cost.late_penalty, w.lateness
+    )
+    churn = round(OBJECTIVE_SCALE * w.churn)
     terms: list[cp_model.LinearExprT] = []
     for item_id, scout_ids in by_item.items():
         item = items[item_id]
         assigned = sum(x[item_id, s] for s in scout_ids)
-        late = round(OBJECTIVE_SCALE * w.lateness * urg[item_id])
-        terms.append(late * (1 - assigned))
+        terms.append(round(OBJECTIVE_SCALE * late[item_id]) * (1 - assigned))
         for s in scout_ids:
-            cost = round(OBJECTIVE_SCALE * w.cost * hourly_cost(states[s].scout) * item.hours)
-            if cost:
-                terms.append(cost * x[item_id, s])
-        # Churn: paid unless the item stays with its current scout (moved *or* dropped).
-        # If the current scout can no longer take it at all, every option pays the
-        # same churn, so it is a constant and left out.
-        churn = round(OBJECTIVE_SCALE * w.churn)
+            pay = round(OBJECTIVE_SCALE * w.cost * hourly_cost(states[s].scout) * item.hours)
+            if pay:
+                terms.append(pay * x[item_id, s])
         current = (item_id, item.current_scout_id)
         if churn and current in x:
             terms.append(churn * (1 - x[current]))
-    hint = _edf_hint(pool, scouts, window, cfg, rng, items, capacity)
+    hint = _edf_hint(pool, scouts, window, cfg, rng, cost, deadline, units, free)
     for key, var in x.items():
         model.add_hint(var, key in hint)
     terms.extend(_continuity_terms(model, x, by_item, items, w.continuity, hint))
@@ -264,10 +339,20 @@ def solve_assignment(
     solver.parameters.num_workers = 1
     solver.parameters.random_seed = seed
     solver.parameters.max_deterministic_time = cfg.time_limit_s
-    solver.parameters.max_time_in_seconds = WALL_CLOCK_SAFETY * cfg.time_limit_s
+    solver.parameters.max_time_in_seconds = wall_clock_cap(cfg.time_limit_s)
     status = solver.solve(model)
     status_name = solver.status_name(status)
+    # Stopped without a proof (FEASIBLE / UNKNOWN) before the deterministic budget
+    # was used up: only the wall-clock backstop stops a search there.
+    hit_wall_clock = (
+        status in (cp_model.FEASIBLE, cp_model.UNKNOWN)
+        and solver.deterministic_time < 0.999 * cfg.time_limit_s
+    )
+    if hit_wall_clock:
+        log.warning("optimiser stopped by the wall-clock backstop: this solve is not reproducible")
 
+    if status in (cp_model.INFEASIBLE, cp_model.MODEL_INVALID):
+        raise RuntimeError(f"optimiser model is {status_name}: assigning nothing is feasible, bug")
     if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
         log.warning(
             "optimiser found no feasible solution (%s) for %d items; falling back to EDF",
@@ -275,12 +360,15 @@ def solve_assignment(
             len(pool),
         )
         return SolveReport(
-            edf(pool, scouts, window, cfg, rng),
+            edf(pool, scouts, window, cfg, rng, cost=cost),
             status_name,
+            None,
+            None,
             None,
             solver.wall_time,
             solver.deterministic_time,
             fell_back_to_edf=True,
+            hit_wall_clock=hit_wall_clock,
         )
 
     chosen = [
@@ -288,23 +376,72 @@ def solve_assignment(
         for (item_id, scout_id), var in x.items()
         if solver.boolean_value(var)
     ]
+    objective = solver.objective_value / OBJECTIVE_SCALE
+    bound = solver.best_objective_bound / OBJECTIVE_SCALE
     report = SolveReport(
         sorted(chosen, key=lambda a: a.item_id),
         status_name,
-        solver.objective_value / OBJECTIVE_SCALE,
+        objective,
+        bound,
+        (objective - bound) / max(1.0, abs(objective)),
         solver.wall_time,
         solver.deterministic_time,
+        hit_wall_clock=hit_wall_clock,
     )
     log.debug(
-        "optimiser: %s, %d/%d items assigned, %d vars, objective %.2f, %.3f s wall",
+        "optimiser: %s, %d/%d items assigned, %d vars, objective %.2f (gap %.3f), %.3f s wall",
         status_name,
         len(chosen),
         len(pool),
         len(x),
-        report.objective,
+        objective,
+        report.gap,
         report.wall_time_s,
     )
     return report
+
+
+def _edf_hint(
+    pool: Sequence[WorkItem],
+    scouts: Sequence[ScoutState],
+    window: AssignmentWindow,
+    cfg: AssignmentParams,
+    rng: np.random.Generator,
+    cost: CostParams,
+    deadline: dict[tuple[str, str], int],
+    units: dict[str, int],
+    free: dict[str, list[int]],
+) -> set[tuple[str, str]]:
+    """EDF's answer as ``(item_id, scout_id)`` pairs, trimmed to what the model allows.
+
+    EDF only respects each scout's window total, in floats. The model also
+    asks for due-date capacity, in rounded integers. Pairs that would break it
+    are dropped, in EDF order: a hint must be feasible for CP-SAT to start
+    from it, and a *complete* feasible hint gives a first solution at once.
+    """
+    n_days = window.n_days
+    due_units = {sid: [0] * n_days for sid in free}  # hinted units per deadline day
+    hint: set[tuple[str, str]] = set()
+    edf_answer = {a.item_id: a.scout_id for a in edf(pool, scouts, window, cfg, rng, cost=cost)}
+    for item in sorted(pool, key=lambda i: (i.due_date, i.received_date, i.item_id)):
+        sid = edf_answer.get(item.item_id)
+        key = (item.item_id, sid or "")
+        if sid is None or key not in deadline:
+            continue
+        j = deadline[key]
+        trial = due_units[sid].copy()
+        trial[j] += units[item.item_id]
+        running = 0
+        ok = True
+        for k in range(n_days):
+            running += trial[k]
+            if running > free[sid][k]:
+                ok = False
+                break
+        if ok:
+            due_units[sid] = trial
+            hint.add(key)
+    return hint
 
 
 def _continuity_terms(
@@ -319,7 +456,7 @@ def _continuity_terms(
 
     For each request and each candidate scout not already on it, a boolean
     ``y[s]`` that must be 1 if the scout gets any of the request's items
-    (``x[i, s] <= y[s]``; minimising keeps ``y`` at 0 otherwise). If someone is
+    (``x[i, s] => y[s]``; minimising keeps ``y`` at 0 otherwise). If someone is
     already on the request, every new scout is an extra one; if nobody is,
     the first scout is free and only the ones after it count.
     """
@@ -356,49 +493,14 @@ def _continuity_terms(
     return terms
 
 
-def _scaled_hours(hours: float) -> int:
-    """Item hours in hundredths, rounded up (never under-count work)."""
-    return math.ceil(hours * HOURS_SCALE - 1e-6)
-
-
-def _scaled_capacity(hours: float) -> int:
-    """Free hours in hundredths, rounded down (never over-count capacity)."""
-    return math.floor(hours * HOURS_SCALE + 1e-6)
-
-
-def _edf_hint(
-    pool: Sequence[WorkItem],
-    scouts: Sequence[ScoutState],
-    window: AssignmentWindow,
-    cfg: AssignmentParams,
-    rng: np.random.Generator,
-    items: dict[str, WorkItem],
-    capacity: dict[str, int],
-) -> set[tuple[str, str]]:
-    """EDF's answer as ``(item_id, scout_id)`` pairs, trimmed to fit the integer model.
-
-    EDF checks hours in floats; the model rounds item hours up and capacity
-    down, so a scout EDF filled to the last minute may be a few hundredths
-    over in the model. Such pairs are dropped: a hint must be feasible for
-    CP-SAT to start from it, and a *complete* feasible hint lets the solver
-    have a first solution almost immediately.
-    """
-    used: defaultdict[str, int] = defaultdict(int)
-    hint: set[tuple[str, str]] = set()
-    for a in edf(pool, scouts, window, cfg, rng):
-        need = _scaled_hours(items[a.item_id].hours)
-        if used[a.scout_id] + need <= capacity.get(a.scout_id, 0):
-            used[a.scout_id] += need
-            hint.add((a.item_id, a.scout_id))
-    return hint
-
-
 def optimiser(
     pool: Sequence[WorkItem],
     scouts: Sequence[ScoutState],
     window: AssignmentWindow,
     cfg: AssignmentParams,
     rng: np.random.Generator,
+    *,
+    cost: CostParams,
 ) -> list[Assignment]:
     """CP-SAT policy (the registry entry): the assignments of :func:`solve_assignment`."""
-    return solve_assignment(pool, scouts, window, cfg, rng).assignments
+    return solve_assignment(pool, scouts, window, cfg, rng, cost=cost).assignments

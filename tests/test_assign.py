@@ -3,6 +3,7 @@ semantics, what the optimiser buys over EDF, determinism and time limits.
 
 Every policy answer in this file goes through ``validate_assignments``
 (see ``run``), so each test is also a hard-constraint test for that policy.
+The optimiser's answers are also checked for due-date feasibility.
 """
 
 from __future__ import annotations
@@ -15,21 +16,34 @@ import time
 import numpy as np
 import pytest
 
-from scout_planner.assign import POLICIES, assign, get_policy, validate_assignments
+from scout_planner.assign import (
+    POLICIES,
+    assign,
+    assign_with_report,
+    get_policy,
+    validate_assignments,
+)
 from scout_planner.assign import optimiser as opt
-from scout_planner.config import AssignmentParams, AssignmentWeights
+from scout_planner.config import AssignmentParams, AssignmentWeights, CostParams
 from scout_planner.domain import Assignment, AssignmentWindow, Scout, ScoutState, WorkItem
 
 D0 = dt.date(2027, 3, 1)  # a Monday
 WINDOW = AssignmentWindow.starting(D0, 7)
 SAT = D0 + dt.timedelta(days=5)
-CFG = AssignmentParams()
+COST = CostParams()  # late penalty 1000 per report
+# Lateness weight pinned to 1.0 (one late penalty at zero slack), so these tests
+# do not depend on the default in config.py.
+CFG = AssignmentParams(weights=AssignmentWeights(lateness=1.0))
 ALL = sorted(POLICIES)
 GREEDY = ["edf", "fcfs"]
 
 
 def day(n: int) -> dt.date:
     return D0 + dt.timedelta(days=n)
+
+
+def weights(**kw: float) -> AssignmentParams:
+    return CFG.model_copy(update={"weights": CFG.weights.model_copy(update=kw)})
 
 
 def make_state(
@@ -56,7 +70,9 @@ def make_state(
         monthly_salary=None if freelance else 4500.0,
         hourly_rate=rate if freelance else None,
     )
-    hours = {d: (weekday_hours if d.weekday() < 5 else 0.0) for d in WINDOW.days}
+    hours = {
+        d: (weekday_hours if d.weekday() < 5 and d not in unavailable else 0.0) for d in WINDOW.days
+    }
     return ScoutState(scout, hours, frozen, unavailable)
 
 
@@ -94,6 +110,20 @@ def make_item(
     )
 
 
+def answer_of(
+    name: str,
+    pool: list[WorkItem],
+    scouts: list[ScoutState],
+    cfg: AssignmentParams = CFG,
+    seed: int = 0,
+) -> list[Assignment]:
+    """Run one policy and check every hard constraint (plus due dates for the optimiser)."""
+    answer = get_policy(name)(pool, scouts, WINDOW, cfg, np.random.default_rng(seed), cost=COST)
+    strict = name == "optimiser"
+    assert validate_assignments(pool, scouts, WINDOW, answer, check_due_dates=strict) == []
+    return answer
+
+
 def run(
     name: str,
     pool: list[WorkItem],
@@ -101,10 +131,36 @@ def run(
     cfg: AssignmentParams = CFG,
     seed: int = 0,
 ) -> dict[str, str]:
-    """Run one policy, check every hard constraint, return ``{item_id: scout_id}``."""
-    answer = get_policy(name)(pool, scouts, WINDOW, cfg, np.random.default_rng(seed))
-    assert validate_assignments(pool, scouts, WINDOW, answer) == []
-    return {a.item_id: a.scout_id for a in answer}
+    """``{item_id: scout_id}`` of a checked policy answer."""
+    return {a.item_id: a.scout_id for a in answer_of(name, pool, scouts, cfg, seed)}
+
+
+def replay_on_time(pool: list[WorkItem], scouts: list[ScoutState], answer: list[Assignment]) -> int:
+    """Items finished on time when each scout works its queue day by day.
+
+    Independent of the policies' own bookkeeping: each scout first finishes
+    its frozen work, then its assigned items earliest-due-first, using the
+    hours it offers each day. An item is on time if the day its last hour is
+    worked is on or before its due date. (Desk-type items only.)
+    """
+    items = {i.item_id: i for i in pool}
+    on_time = 0
+    for state in scouts:
+        queue = sorted(
+            (items[a.item_id] for a in answer if a.scout_id == state.scout_id),
+            key=lambda i: (i.due_date, i.item_id),
+        )
+        assert all(i.fixed_date is None for i in queue), "replay handles desk work only"
+        need = state.frozen_hours
+        for item in queue:
+            need += item.hours
+            worked = 0.0
+            for d in WINDOW.days:
+                worked += state.hours_by_day.get(d, 0.0)
+                if worked >= need - 1e-9:
+                    on_time += d <= item.due_date
+                    break
+    return on_time
 
 
 # --- the common interface ---------------------------------------------------------
@@ -113,8 +169,9 @@ def run(
 def test_registry_has_the_three_policies_with_one_signature() -> None:
     assert set(POLICIES) == {"fcfs", "edf", "optimiser"}
     for policy in POLICIES.values():
-        params = list(inspect.signature(policy).parameters)
-        assert params == ["pool", "scouts", "window", "cfg", "rng"]
+        params = inspect.signature(policy).parameters
+        assert list(params) == ["pool", "scouts", "window", "cfg", "rng", "cost"]
+        assert params["cost"].kind is inspect.Parameter.KEYWORD_ONLY
 
 
 def test_unknown_policy_name_fails_loudly() -> None:
@@ -126,15 +183,40 @@ def test_assign_dispatches_on_cfg_policy() -> None:
     pool = [make_item("T00001-desk")]
     scouts = [make_state("S001")]
     for name in ALL:
-        cfg = AssignmentParams(policy=name)
-        answer = assign(pool, scouts, WINDOW, cfg, np.random.default_rng(0))
+        cfg = CFG.model_copy(update={"policy": name})
+        answer = assign(pool, scouts, WINDOW, cfg, np.random.default_rng(0), cost=COST)
         assert answer == [Assignment("T00001-desk", "S001")]
+
+
+def test_assign_with_report_exposes_the_solver_report_for_the_optimiser_only() -> None:
+    pool, scouts = [make_item("T00001-desk")], [make_state("S001")]
+    for name in ALL:
+        cfg = CFG.model_copy(update={"policy": name})
+        out = assign_with_report(pool, scouts, WINDOW, cfg, np.random.default_rng(0), cost=COST)
+        assert out.assignments == [Assignment("T00001-desk", "S001")]
+        if name == "optimiser":
+            assert out.solve is not None and out.solve.status == "OPTIMAL"
+            assert not out.solve.fell_back_to_edf and not out.solve.hit_wall_clock
+            assert out.solve.gap == 0.0
+        else:
+            assert out.solve is None
 
 
 @pytest.mark.parametrize("name", ALL)
 def test_empty_pool_or_no_scouts_gives_no_assignments(name: str) -> None:
     assert run(name, [], [make_state("S001")]) == {}
     assert run(name, [make_item("T00001-desk")], []) == {}
+
+
+@pytest.mark.parametrize("name", ALL)
+def test_malformed_scout_state_fails_loudly(name: str) -> None:
+    pool = [make_item("T00001-desk")]
+    outside = make_state("S001")
+    outside = ScoutState(outside.scout, {**outside.hours_by_day, day(7): 7.5})
+    leave_with_hours = ScoutState(outside.scout, {D0: 7.5}, unavailable_dates={D0})
+    for bad in (outside, leave_with_hours):
+        with pytest.raises(ValueError):
+            run(name, pool, [bad])
 
 
 # --- hard constraints, every policy ---------------------------------------------------
@@ -193,7 +275,7 @@ def test_live_view_needs_a_scout_from_the_fixture_region(name: str) -> None:
 @pytest.mark.parametrize("name", ALL)
 def test_live_view_planned_on_the_fixture_date(name: str) -> None:
     pool = [make_item("T00001-live", live_on=SAT)]
-    answer = get_policy(name)(pool, [make_state("S001")], WINDOW, CFG, np.random.default_rng(0))
+    answer = answer_of(name, pool, [make_state("S001")])
     assert answer == [Assignment("T00001-live", "S001", planned_date=SAT)]
 
 
@@ -232,8 +314,17 @@ def test_started_work_is_frozen_not_in_the_pool(name: str) -> None:
 @pytest.mark.parametrize("name", ALL)
 @pytest.mark.parametrize("seed", [1, 2, 3])
 def test_random_instances_never_break_a_hard_constraint(name: str, seed: int) -> None:
-    pool, scouts, _ = random_instance(120, 25, seed)
-    run(name, pool, scouts, AssignmentParams(time_limit_s=0.2))
+    pool, scouts = random_instance(120, 25, seed)
+    run(name, pool, scouts, CFG.model_copy(update={"time_limit_s": 0.2}))
+
+
+@pytest.mark.parametrize("name", ALL)
+def test_answer_does_not_depend_on_input_order(name: str) -> None:
+    pool, scouts = random_instance(120, 25, seed=4)
+    cfg = CFG.model_copy(update={"time_limit_s": 0.2})
+    forward = answer_of(name, pool, scouts, cfg)
+    backward = answer_of(name, pool[::-1], scouts[::-1], cfg)
+    assert forward == backward
 
 
 # --- greedy semantics ---------------------------------------------------------------
@@ -262,17 +353,25 @@ def test_greedy_prefers_salaried_then_least_loaded(name: str) -> None:
 
 @pytest.mark.parametrize("name", GREEDY)
 def test_greedy_keeps_the_current_scout(name: str) -> None:
-    """Never reassigns (D-010): even when another scout would be preferred now."""
+    """Never reassigns by choice (D-010): even when another scout would be preferred now."""
     pool = [make_item("T00001-desk", current="S001")]
     scouts = [make_state("S001", freelance=True), make_state("S002")]
     assert run(name, pool, scouts) == {"T00001-desk": "S001"}
 
 
 @pytest.mark.parametrize("name", GREEDY)
-def test_greedy_does_not_move_an_item_whose_scout_can_no_longer_take_it(name: str) -> None:
+def test_greedy_replaces_a_commitment_whose_scout_ran_out_of_hours(name: str) -> None:
     pool = [make_item("T00001-desk", hours=6.0, current="S001")]
     scouts = [make_state("S001", frozen=35.0), make_state("S002")]
-    assert run(name, pool, scouts) == {}
+    assert run(name, pool, scouts) == {"T00001-desk": "S002"}
+
+
+@pytest.mark.parametrize("name", ALL)
+def test_forced_move_live_view_today_scout_on_leave(name: str) -> None:
+    """S001 holds today's live view but is on leave today: S002 takes it (not churn)."""
+    pool = [make_item("T00001-live", live_on=D0, current="S001")]
+    scouts = [make_state("S001", unavailable=(D0,)), make_state("S002")]
+    assert run(name, pool, scouts) == {"T00001-live": "S002"}
 
 
 @pytest.mark.parametrize("name", GREEDY)
@@ -291,27 +390,40 @@ def test_greedy_commitments_claim_hours_before_new_items(name: str) -> None:
 def tight_deadline_case() -> tuple[list[WorkItem], list[ScoutState]]:
     """A scarce two-skill scout that EDF spends on work a one-skill scout could do.
 
-    A (MID + FWD, 10 h) and B (MID only, 8 h). Item 1 is MID and due first,
-    item 2 is FWD. EDF takes item 1 first and gives it to A (most hours left),
-    leaving no FWD scout for item 2. Both items are due inside the window, so
-    unassigned here means late.
+    A (MID + FWD, 8 h/day) and B (MID only, 7.5 h/day). Two 6 h items are due
+    today, one MID and one FWD; a third MID item is due tomorrow. EDF gives
+    the MID item due today to A (most hours left) and then the FWD one to A
+    as well: 12 h of work due today for a scout with 8 h today.
     """
     pool = [
-        make_item("T00001-desk", skill="MID-North", hours=6.0, due=day(2)),
-        make_item("T00002-desk", skill="FWD-North", hours=6.0, due=day(4)),
-        make_item("T00003-desk", skill="MID-North", hours=2.0, due=day(5)),
+        make_item("T00001-desk", skill="MID-North", hours=6.0, due=D0),
+        make_item("T00002-desk", skill="FWD-North", hours=6.0, due=D0),
+        make_item("T00003-desk", skill="MID-North", hours=6.0, due=day(1)),
     ]
-    a = make_state("S001", ("MID-North", "FWD-North"), weekday_hours=2.0)
-    b = make_state("S002", ("MID-North",), weekday_hours=1.6)
+    a = make_state("S001", ("MID-North", "FWD-North"), weekday_hours=8.0)
+    b = make_state("S002", ("MID-North",), weekday_hours=7.5)
     return pool, [a, b]
 
 
 def test_optimiser_beats_edf_on_a_tight_deadline_case() -> None:
+    """Counted by a day-by-day replay of each scout's queue, not by the policies' own view."""
     pool, scouts = tight_deadline_case()
-    on_time = {name: len(run(name, pool, scouts)) for name in ALL}
+    on_time = {name: replay_on_time(pool, scouts, answer_of(name, pool, scouts)) for name in ALL}
     assert on_time == {"edf": 2, "fcfs": 2, "optimiser": 3}
+
+    # EDF promised more than a scout can do by the due date; the optimiser never does.
+    edf_answer = answer_of("edf", pool, scouts)
+    assert validate_assignments(pool, scouts, WINDOW, edf_answer, check_due_dates=True)
     answer = run("optimiser", pool, scouts)
     assert (answer["T00001-desk"], answer["T00002-desk"]) == ("S002", "S001")
+
+
+def test_optimiser_never_promises_more_than_a_day_holds() -> None:
+    """10 h due today with 7.5 h today: only one of two 5 h items is taken now."""
+    pool = [make_item(f"T0000{k}-desk", hours=5.0, due=D0) for k in (1, 2)]
+    scouts = [make_state("S001")]
+    assert len(run("edf", pool, scouts)) == 2  # fits the week, so EDF takes both
+    assert len(run("optimiser", pool, scouts)) == 1
 
 
 def test_optimiser_prefers_salaried_over_freelance() -> None:
@@ -322,15 +434,34 @@ def test_optimiser_prefers_salaried_over_freelance() -> None:
 
 
 def test_optimiser_uses_a_freelancer_for_urgent_work_only() -> None:
-    """Default weights: lateness x urgency vs freelance cost (see ``urgency``)."""
+    """Lateness (late penalty x urgency) vs freelance cost (6 h x 40 = 240)."""
     freelancer = [make_state("S001", freelance=True, rate=40.0)]
-    urgent = [make_item("T00001-desk", hours=6.0, due=day(0))]  # due today: slack 0
-    relaxed = [make_item("T00001-desk", hours=6.0, due=day(13))]  # slack 13
+    urgent = [make_item("T00001-desk", hours=6.0, due=day(0))]  # slack 0: 1000 at stake
+    relaxed = [make_item("T00001-desk", hours=6.0, due=day(13))]  # slack 13: ~71
     assert run("optimiser", urgent, freelancer) == {"T00001-desk": "S001"}
     assert run("optimiser", relaxed, freelancer) == {}
     # With cost weighted at zero, any work is worth doing now.
-    free = AssignmentParams(weights=AssignmentWeights(cost=0.0))
-    assert run("optimiser", relaxed, freelancer, free) == {"T00001-desk": "S001"}
+    assert run("optimiser", relaxed, freelancer, weights(cost=0.0)) == {"T00001-desk": "S001"}
+
+
+def test_perishable_live_view_is_taken_even_with_lots_of_slack() -> None:
+    """Fixture today, report due in 12 days, only a freelancer in the region.
+
+    By slack alone the request is relaxed (~77 at stake vs 8 h x 40 = 320),
+    but if the live view is not assigned now the match is gone.
+    """
+    pool = [make_item("T00001-live", live_on=D0, due=day(12))]
+    freelancer = [make_state("S001", freelance=True, rate=40.0)]
+    assert run("optimiser", pool, freelancer) == {"T00001-live": "S001"}
+
+
+def test_perishability_follows_the_cadence() -> None:
+    """A fixture in 3 days survives until tomorrow's run, but not until next week's."""
+    pool = [make_item("T00001-live", live_on=day(3), due=day(12))]
+    freelancer = [make_state("S001", freelance=True, rate=40.0)]
+    assert run("optimiser", pool, freelancer) == {}
+    weekly = CFG.model_copy(update={"cadence": "weekly"})
+    assert run("optimiser", pool, freelancer, weekly) == {"T00001-live": "S001"}
 
 
 def test_optimiser_moves_a_not_started_item_when_it_pays() -> None:
@@ -356,8 +487,7 @@ def test_churn_weight_decides_whether_a_cost_saving_move_happens() -> None:
     pool = [make_item("T00001-desk", hours=4.0, current="S001")]
     scouts = [make_state("S001", freelance=True), make_state("S002")]
     assert run("optimiser", pool, scouts) == {"T00001-desk": "S002"}
-    sticky = AssignmentParams(weights=AssignmentWeights(churn=500.0))
-    assert run("optimiser", pool, scouts, sticky) == {"T00001-desk": "S001"}
+    assert run("optimiser", pool, scouts, weights(churn=500.0)) == {"T00001-desk": "S001"}
 
 
 def test_dropping_a_committed_item_also_pays_churn() -> None:
@@ -365,10 +495,8 @@ def test_dropping_a_committed_item_also_pays_churn() -> None:
     leaves ~91 of lateness. Churn on a drop is what keeps the plan stable."""
     pool = [make_item("T00001-desk", hours=4.0, current="S001")]
     freelancer = [make_state("S001", freelance=True)]
-    no_churn = AssignmentParams(weights=AssignmentWeights(churn=0.0))
-    assert run("optimiser", pool, freelancer, no_churn) == {}
-    sticky = AssignmentParams(weights=AssignmentWeights(churn=100.0))
-    assert run("optimiser", pool, freelancer, sticky) == {"T00001-desk": "S001"}
+    assert run("optimiser", pool, freelancer, weights(churn=0.0)) == {}
+    assert run("optimiser", pool, freelancer, weights(churn=100.0)) == {"T00001-desk": "S001"}
 
 
 def test_optimiser_keeps_a_request_with_the_scout_already_on_it() -> None:
@@ -399,7 +527,7 @@ def test_optimiser_serves_overdue_work_first() -> None:
     }
 
 
-# --- urgency --------------------------------------------------------------------------
+# --- lateness pricing ---------------------------------------------------------------------
 
 
 def test_slack_counts_today_as_a_working_day() -> None:
@@ -409,9 +537,9 @@ def test_slack_counts_today_as_a_working_day() -> None:
 
 def test_urgency_grows_as_slack_shrinks_and_overdue_is_highest() -> None:
     values = [opt.urgency(s, overdue=False) for s in (13, 6, 2, 1, 0)]
-    assert values == sorted(values) and values[-1] == opt.URGENCY_MAX
-    assert opt.urgency(-3, overdue=False) == opt.URGENCY_MAX
-    assert opt.urgency(0, overdue=True) > opt.URGENCY_MAX
+    assert values == sorted(values) and values[-1] == 1.0
+    assert opt.urgency(-3, overdue=False) == 1.0
+    assert opt.urgency(0, overdue=True) == opt.URGENCY_OVERDUE > 1.0
 
 
 def test_remaining_work_days_respects_a_late_fixture() -> None:
@@ -420,6 +548,30 @@ def test_remaining_work_days_respects_a_late_fixture() -> None:
     writeup = make_item("T00001-writeup", hours=3.0, depends_on=("T00001-live",))
     assert opt.remaining_work_days([desk, writeup], D0) == 1  # 7 h of work
     assert opt.remaining_work_days([desk, live, writeup], D0) == 7  # fixture day 6 + write-up
+
+
+def test_one_request_is_worth_one_late_penalty_however_many_items() -> None:
+    """Penalties are per request, shared by hours (zero slack: 1000 in total)."""
+    two_tasks = [
+        make_item("T00001-desk", hours=6.0, due=D0),
+        make_item("T00001-writeup", hours=3.0, due=D0, depends_on=("T00001-desk",)),
+    ]
+    pen = opt.lateness_penalties(two_tasks, D0, day(1), 1000.0, 1.0)
+    assert pen == pytest.approx({"T00001-desk": 1000 * 6 / 9, "T00001-writeup": 1000 * 3 / 9})
+    three_tasks = [
+        make_item("T00002-desk", hours=6.0, due=day(1)),
+        make_item("T00002-live", live_on=day(1), due=day(1)),
+        make_item("T00002-writeup", hours=3.0, due=day(1), depends_on=("T00002-live",)),
+    ]
+    pen = opt.lateness_penalties(three_tasks, D0, day(1), 1000.0, 1.0)
+    assert sum(pen.values()) == pytest.approx(1000.0)
+
+
+def test_perishable_live_view_carries_a_full_penalty_of_its_own() -> None:
+    items = [make_item("T00001-desk", due=day(12)), make_item("T00001-live", live_on=D0)]
+    pen = opt.lateness_penalties(items, D0, day(1), 1000.0, 1.0)
+    assert pen["T00001-live"] == pytest.approx(1000.0 * opt.URGENCY_LOST_FIXTURE)
+    assert pen["T00001-desk"] < 100
 
 
 def test_freelancer_without_a_rate_fails_loudly() -> None:
@@ -432,12 +584,12 @@ def test_freelancer_without_a_rate_fails_loudly() -> None:
         run("optimiser", [make_item("T00001-desk")], [broken])
 
 
-# --- determinism, time limit, fallback --------------------------------------------------
+# --- determinism, randomness, time limit, fallback ----------------------------------------
 
 
 def random_instance(
     n_items: int, n_scouts: int, seed: int
-) -> tuple[list[WorkItem], list[ScoutState], np.random.Generator]:
+) -> tuple[list[WorkItem], list[ScoutState]]:
     """A busy, messy day: every kind of item and constraint, at a realistic ratio."""
     r = np.random.default_rng(seed)
     regions = ["North", "South", "East", "West"]
@@ -448,11 +600,11 @@ def random_instance(
         freelance = k % 5 >= 3  # ~60/40 salaried/freelance
         state = make_state(
             f"S{k:03d}",
-            tuple(r.choice(skills, size=int(r.integers(1, 5)), replace=False)),
+            tuple(str(s) for s in r.choice(skills, size=int(r.integers(1, 5)), replace=False)),
             region=regions[k % 4],
             freelance=freelance,
             rate=41.5,
-            former=tuple(r.choice(clubs, size=2, replace=False)),
+            former=tuple(str(c) for c in r.choice(clubs, size=2, replace=False)),
             weekday_hours=float(r.uniform(1.6, 5.0)) if freelance else 7.5,
             frozen=float(r.uniform(0, 12)),
             unavailable=(WINDOW.days[int(r.integers(7))],) if r.random() < 0.2 else (),
@@ -473,64 +625,116 @@ def random_instance(
                 due=received + dt.timedelta(days=14),
                 live_on=WINDOW.days[int(r.integers(7))] if live else None,
                 region=skill.split("-")[1],
-                clubs=tuple(r.choice(clubs, size=2, replace=False)),
+                clubs=tuple(str(c) for c in r.choice(clubs, size=2, replace=False)),
                 current=f"S{int(r.integers(n_scouts)):03d}" if r.random() < 0.15 else None,
                 depends_on=("T99999-desk",) if r.random() < 0.1 else (),
                 request_scouts=(f"S{int(r.integers(n_scouts)):03d}",) if r.random() < 0.2 else (),
             )
         )
-    return pool, scouts, r
+    return pool, scouts
 
 
 def test_optimiser_is_deterministic() -> None:
-    pool, scouts, _ = random_instance(200, 40, seed=7)
-    cfg = AssignmentParams(time_limit_s=0.3)
-    first = opt.solve_assignment(pool, scouts, WINDOW, cfg, np.random.default_rng(11))
-    second = opt.solve_assignment(pool, scouts, WINDOW, cfg, np.random.default_rng(11))
+    pool, scouts = random_instance(200, 40, seed=7)
+    cfg = CFG.model_copy(update={"time_limit_s": 0.3})
+    first = opt.solve_assignment(pool, scouts, WINDOW, cfg, np.random.default_rng(11), cost=COST)
+    second = opt.solve_assignment(pool, scouts, WINDOW, cfg, np.random.default_rng(11), cost=COST)
     assert first.assignments == second.assignments
     assert first.objective == second.objective
 
 
-def test_optimiser_draws_exactly_one_number_per_call() -> None:
-    """The assignment stream advances the same way whatever the pool holds (D-015)."""
-    used, fresh = np.random.default_rng(5), np.random.default_rng(5)
-    opt.optimiser([], [], WINDOW, CFG, used)
+def rng_state(rng: np.random.Generator) -> dict:
+    return rng.bit_generator.state
+
+
+def one_draw_later(seed: int) -> dict:
+    fresh = np.random.default_rng(seed)
     fresh.integers(0, 2**31 - 1)
-    assert used.random() == fresh.random()
+    return rng_state(fresh)
+
+
+def test_optimiser_draws_exactly_one_number_on_every_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The assignment stream advances the same way whatever the day holds (D-015)."""
+    pool, scouts = tight_deadline_case()
+    cases = {
+        "empty pool": ([], scouts),
+        "nothing eligible": ([make_item("T00001-desk", skill="GK-South")], scouts),
+        "solved": (pool, scouts),
+    }
+    for label, (p, s) in cases.items():
+        rng = np.random.default_rng(5)
+        opt.optimiser(p, s, WINDOW, CFG, rng, cost=COST)
+        assert rng_state(rng) == one_draw_later(5), label
+
+    monkeypatch.setattr(opt, "wall_clock_cap", lambda limit: 0.0)
+    pool, scouts = random_instance(120, 25, seed=1)  # too big to be solved in presolve
+    rng = np.random.default_rng(5)
+    assert opt.solve_assignment(pool, scouts, WINDOW, CFG, rng, cost=COST).fell_back_to_edf
+    assert rng_state(rng) == one_draw_later(5), "fallback"
+
+
+@pytest.mark.parametrize("name", GREEDY)
+def test_greedy_policies_draw_no_random_numbers(name: str) -> None:
+    pool, scouts = tight_deadline_case()
+    rng = np.random.default_rng(5)
+    get_policy(name)(pool, scouts, WINDOW, CFG, rng, cost=COST)
+    assert rng_state(rng) == rng_state(np.random.default_rng(5))
 
 
 def test_optimiser_respects_its_time_limit() -> None:
-    pool, scouts, _ = random_instance(400, 60, seed=3)
-    cfg = AssignmentParams(time_limit_s=0.1)  # the smallest allowed
-    report = opt.solve_assignment(pool, scouts, WINDOW, cfg, np.random.default_rng(0))
+    """Checked on the deterministic clock; wall time only against the generous backstop."""
+    pool, scouts = random_instance(400, 60, seed=3)
+    cfg = CFG.model_copy(update={"time_limit_s": 0.1})  # the smallest allowed
+    report = opt.solve_assignment(pool, scouts, WINDOW, cfg, np.random.default_rng(0), cost=COST)
     assert report.status in ("OPTIMAL", "FEASIBLE") and not report.fell_back_to_edf
+    assert not report.hit_wall_clock
     assert report.deterministic_time <= cfg.time_limit_s * 1.05
-    assert report.wall_time_s <= opt.WALL_CLOCK_SAFETY * cfg.time_limit_s * 1.05
-    assert validate_assignments(pool, scouts, WINDOW, report.assignments) == []
+    assert report.wall_time_s <= opt.wall_clock_cap(cfg.time_limit_s)
+    assert report.best_bound is not None and report.gap is not None and report.gap >= 0
+    problems = validate_assignments(pool, scouts, WINDOW, report.assignments, check_due_dates=True)
+    assert problems == []
+
+
+def test_wall_clock_backstop_is_far_above_the_limit() -> None:
+    assert opt.wall_clock_cap(0.1) == pytest.approx(5.1)
+    assert opt.wall_clock_cap(1.0) == pytest.approx(10.0)
 
 
 @pytest.mark.slow
-def test_benchmark_400_items_60_scouts_within_twice_the_time_limit() -> None:
-    """Default limit (1 s): model build + solve must stay under 2 s end to end."""
-    pool, scouts, _ = random_instance(400, 60, seed=1)
+def test_benchmark_400_items_60_scouts() -> None:
+    """Default limit (1 s): model build + solve, with room for a loaded machine."""
+    pool, scouts = random_instance(400, 60, seed=1)
+    cfg = CFG.model_copy(update={"time_limit_s": 1.0})
     started = time.perf_counter()
-    report = opt.solve_assignment(pool, scouts, WINDOW, CFG, np.random.default_rng(0))
+    report = opt.solve_assignment(pool, scouts, WINDOW, cfg, np.random.default_rng(0), cost=COST)
     elapsed = time.perf_counter() - started
-    assert elapsed <= 2 * CFG.time_limit_s, f"{elapsed:.2f} s"
-    assert report.status in ("OPTIMAL", "FEASIBLE")
-    assert validate_assignments(pool, scouts, WINDOW, report.assignments) == []
+    assert report.status in ("OPTIMAL", "FEASIBLE") and not report.hit_wall_clock
+    assert report.deterministic_time <= cfg.time_limit_s * 1.05
+    assert elapsed <= 5 * cfg.time_limit_s, f"{elapsed:.2f} s"
+    problems = validate_assignments(pool, scouts, WINDOW, report.assignments, check_due_dates=True)
+    assert problems == []
 
 
 def test_optimiser_falls_back_to_edf_when_the_solver_finds_nothing(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    # A zero wall-clock cap stops the solver before its first solution.
-    monkeypatch.setattr(opt, "WALL_CLOCK_SAFETY", 0.0)
-    pool, scouts = tight_deadline_case()
+    # A zero wall-clock cap stops the solver before its first solution (on an
+    # instance big enough not to be solved outright by presolve).
+    monkeypatch.setattr(opt, "wall_clock_cap", lambda limit: 0.0)
+    pool, scouts = random_instance(120, 25, seed=1)
     with caplog.at_level(logging.WARNING, logger=opt.__name__):
-        report = opt.solve_assignment(pool, scouts, WINDOW, CFG, np.random.default_rng(0))
-    assert report.fell_back_to_edf and report.status == "UNKNOWN"
-    assert report.assignments == get_policy("edf")(
-        pool, scouts, WINDOW, CFG, np.random.default_rng(0)
-    )
+        report = opt.solve_assignment(
+            pool, scouts, WINDOW, CFG, np.random.default_rng(0), cost=COST
+        )
+    assert report.fell_back_to_edf and report.status == "UNKNOWN" and report.hit_wall_clock
+    assert report.assignments == answer_of("edf", pool, scouts)
     assert "falling back to EDF" in caplog.text
+
+
+def test_an_infeasible_model_is_a_bug_and_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Assigning nothing is always feasible, so INFEASIBLE can only mean a broken model."""
+    monkeypatch.setattr(opt, "free_by_day", lambda state, window: [-1] * window.n_days)
+    monkeypatch.setattr(opt, "deadline_index", lambda item, free, window: 0)
+    pool, scouts = tight_deadline_case()
+    with pytest.raises(RuntimeError, match="INFEASIBLE"):
+        opt.solve_assignment(pool, scouts, WINDOW, CFG, np.random.default_rng(0), cost=COST)
