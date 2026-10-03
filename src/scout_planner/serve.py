@@ -11,9 +11,10 @@ The worker runs as a separate process (D-013) and must not outlive the app:
   started with ``--exit-with-parent``, notices it was orphaned within one
   poll, and stops on its own.
 
-If a live worker heartbeat already exists (e.g. a worker started by hand with
-``python -m scout_planner.worker``), no second worker is started; the worker's
-own lock would refuse a second one anyway.
+A worker is always started. If another worker (or a CLI run) already holds
+the runs lock, the new one waits as a standby and takes over when the lock is
+released; the lock, not the heartbeat, guarantees there is never more than
+one executor (a heartbeat can look fresh for 10 s after a crash).
 
 Usage::
 
@@ -132,12 +133,8 @@ def main(argv: Sequence[str] | None = None, app_cmd: Sequence[str] | None = None
 
     try:
         args.root.mkdir(parents=True, exist_ok=True)
-        beat = runs.read_heartbeat(args.root)
-        if runs.worker_alive(args.root) and beat is not None:
-            log.info("a worker is already running (pid %d); not starting another", beat.pid)
-        else:
-            worker = subprocess.Popen(worker_command(args.root, args.pipeline))
-            log.info("started worker (pid %d)", worker.pid)
+        worker = subprocess.Popen(worker_command(args.root, args.pipeline))
+        log.info("started worker (pid %d)", worker.pid)
 
         # The app reads its runs folder from SCOUT_RUNS_ROOT; keep it in step with the worker.
         app_env = {**os.environ, "SCOUT_RUNS_ROOT": str(args.root)}

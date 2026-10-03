@@ -80,6 +80,7 @@ __all__ = [
     "remove_heartbeat",
     "request_cancel",
     "run_dir",
+    "run_is_live",
     "slugify",
     "update_status",
     "worker_alive",
@@ -255,16 +256,32 @@ def _code_version() -> str:
 # --- atomic file writes ------------------------------------------------------------
 
 
+def _fsync_dir(folder: Path) -> None:
+    """Make a rename inside ``folder`` durable (the folder's entry list is data too)."""
+    with contextlib.suppress(OSError):
+        dir_fd = os.open(folder, os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+
+
 def _atomic_write_text(path: Path, text: str) -> None:
     """Write ``text`` to ``path`` so that readers never see a partial file.
 
     The temp file lives in the same folder because ``os.replace`` is only atomic
     within one filesystem. Its name starts with ``.`` so listings skip it.
-    ``fsync`` makes the bytes durable before the swap, so a power cut can't
-    leave an empty file under the real name.
+    ``fsync`` on the file before the swap and on the folder after it makes the
+    new content survive an OS crash, not just a process crash.
+
+    Not done: ``F_FULLFSYNC`` on macOS (plain ``fsync`` there may leave data in
+    the drive's cache). It costs tens of ms per call and these files are
+    rewritten up to ~3x/s; the worst a power cut can do is roll a status back
+    or leave it unreadable, which the readers already handle.
     """
     fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
     try:
+        os.fchmod(fd, 0o644)  # mkstemp creates 0600; these files are meant to be readable
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             handle.write(text)
             handle.flush()
@@ -274,6 +291,7 @@ def _atomic_write_text(path: Path, text: str) -> None:
         with contextlib.suppress(FileNotFoundError):
             os.unlink(tmp_name)
         raise
+    _fsync_dir(path.parent)
 
 
 def _write_status(folder: Path, status: RunStatus) -> None:
@@ -368,7 +386,10 @@ def _unreadable(folder: Path, reason: str) -> RunStatus:
     )
 
 
-def _read_status_in(folder: Path) -> RunStatus:
+def _read_status_in(folder: Path, run_id: str | None = None) -> RunStatus:
+    """Parse ``folder/status.json``; ``run_id`` defaults to the folder name
+    (it differs only while a folder sits under a ``_trash-`` name)."""
+    expected = run_id or folder.name
     path = folder / STATUS_FILE
     try:
         text = path.read_text(encoding="utf-8")
@@ -381,7 +402,7 @@ def _read_status_in(folder: Path) -> RunStatus:
     except ValidationError as exc:
         first = exc.errors()[0] if exc.errors() else {"msg": str(exc)}
         return _unreadable(folder, f"status.json is corrupt: {first.get('msg')}")
-    if status.state == "unreadable" or status.run_id != folder.name:
+    if status.state == "unreadable" or status.run_id != expected:
         return _unreadable(folder, "status.json does not describe this folder")
     return status
 
@@ -527,18 +548,45 @@ def cancel_requested(run_id: str, root: Path | str | None = None) -> bool:
     return (run_dir(run_id, root) / CANCEL_FILE).exists()
 
 
+def run_is_live(run_id: str, root: Path | str | None = None) -> bool:
+    """True if a live executor (fresh heartbeat) says it is working on this run.
+
+    A ``running`` status alone is not proof: if the final status write failed,
+    or a worker died, the status says ``running`` with nobody behind it.
+    """
+    beat = read_heartbeat(root)
+    return beat is not None and worker_alive(root) and beat.current_run == run_id
+
+
 def delete_run(run_id: str, root: Path | str | None = None) -> None:
-    """Remove a run folder for good. Refuses while the run is ``running``.
+    """Remove a run folder for good. Refuses while a live executor works on it.
+
+    A ``running`` run whose executor is gone (no fresh heartbeat, or the
+    heartbeat names another run) is stale and may be deleted.
 
     The folder is first renamed to a hidden ``_trash-`` name (atomic), so the
-    run disappears from listings at once and a worker that was about to touch
-    it gets a clean "not found" instead of a half-deleted folder.
+    run disappears from listings at once and the worker gets a clean "not
+    found". The status is then read **again** from the trash: if the worker
+    started the run between our first look and the rename, the folder is put
+    back and the delete is refused (check-then-act race closed by re-checking
+    after the atomic step).
     """
     folder = _existing_run_dir(run_id, root)
-    if _read_status_in(folder).state == "running":
+    if _read_status_in(folder).state == "running" and run_is_live(run_id, root):
         raise RunStoreError(f"run {run_id} is running; cancel it before deleting")
     trash = folder.parent / f"{TRASH_PREFIX}{run_id}-{uuid.uuid4().hex[:8]}"
     os.rename(folder, trash)
+    if _read_status_in(trash, run_id).state == "running" and run_is_live(run_id, root):
+        try:
+            os.rename(trash, folder)
+        except OSError as exc:
+            # A writer recreated the folder in the meantime; the run's process
+            # notices its status.json is gone and stops. The trash is removed
+            # later by cleanup_stale_temp.
+            raise RunStoreError(
+                f"run {run_id} started while being deleted and could not be restored: {exc}"
+            ) from exc
+        raise RunStoreError(f"run {run_id} started while being deleted; it was not deleted")
     shutil.rmtree(trash, ignore_errors=True)
 
 

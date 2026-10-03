@@ -135,6 +135,22 @@ def test_crash_between_temp_write_and_replace_keeps_old_file(
     assert sorted(p.name for p in (root / run_id).iterdir()) == ["params.yaml", "status.json"]
 
 
+def test_status_and_heartbeat_files_are_world_readable(root: Path) -> None:
+    run_id = _create(root)
+    runs.update_status(run_id, root=root, state="running")
+    runs.write_heartbeat(1, None, root)
+    for path in (root / run_id / runs.STATUS_FILE, root / runs.HEARTBEAT_FILE):
+        assert path.stat().st_mode & 0o777 == 0o644
+
+
+def test_atomic_write_syncs_the_folder(root: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    run_id = _create(root)
+    synced: list[Path] = []
+    monkeypatch.setattr(runs, "_fsync_dir", synced.append)
+    runs.update_status(run_id, root=root, state="running")
+    assert synced == [root / run_id]
+
+
 def test_atomic_write_temp_file_is_in_same_folder(
     root: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -395,12 +411,75 @@ def test_delete_run(root: Path, state: str) -> None:
     assert list(root.iterdir()) == []
 
 
-def test_delete_refuses_running(root: Path) -> None:
+def test_delete_refuses_running_run_with_live_executor(root: Path) -> None:
     run_id = _create(root)
     runs.update_status(run_id, root=root, state="running")
+    runs.write_heartbeat(4242, run_id, root)
+    assert runs.run_is_live(run_id, root)
     with pytest.raises(RunStoreError, match="running"):
         runs.delete_run(run_id, root)
     assert (root / run_id).is_dir()
+
+
+@pytest.mark.parametrize("beat", ["none", "stale", "other run"])
+def test_delete_allows_stale_running_run(root: Path, beat: str) -> None:
+    # e.g. the final status write failed: "running" with nobody behind it
+    run_id = _create(root)
+    runs.update_status(run_id, root=root, state="running")
+    if beat == "stale":
+        runs.write_heartbeat(1, run_id, root, now=datetime.now() - timedelta(minutes=5))
+    elif beat == "other run":
+        runs.write_heartbeat(1, "20261003-000000-something-else", root)
+    assert not runs.run_is_live(run_id, root)
+    runs.delete_run(run_id, root)
+    assert not (root / run_id).exists()
+
+
+def _start_run_during_rename(
+    root: Path, run_id: str, monkeypatch: pytest.MonkeyPatch, resurrect: bool = False
+) -> None:
+    """Make the worker 'start' the run just before delete_run's rename to trash."""
+    real_rename = os.rename
+    calls = {"n": 0}
+
+    def racing_rename(src: object, dst: object) -> None:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            runs.write_heartbeat(4242, run_id, root)
+            runs.update_status(run_id, root=root, state="running")
+            real_rename(src, dst)
+            if resurrect:  # a pipeline writer recreates the folder
+                (root / run_id / "raw").mkdir(parents=True)
+            return
+        real_rename(src, dst)
+
+    monkeypatch.setattr(runs.os, "rename", racing_rename)
+
+
+def test_delete_racing_a_starting_run_restores_it(
+    root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run_id = _create(root)
+    _start_run_during_rename(root, run_id, monkeypatch)
+    with pytest.raises(RunStoreError, match="started while being deleted"):
+        runs.delete_run(run_id, root)
+    monkeypatch.undo()
+    assert runs.read_status(run_id, root).state == "running"
+    assert runs.read_params(run_id, root) == Params()
+    assert not [p for p in root.iterdir() if p.name.startswith(runs.TRASH_PREFIX)]
+
+
+def test_delete_race_with_resurrected_folder_is_reported(
+    root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run_id = _create(root)
+    _start_run_during_rename(root, run_id, monkeypatch, resurrect=True)
+    with pytest.raises(RunStoreError, match="could not be restored"):
+        runs.delete_run(run_id, root)
+    monkeypatch.undo()
+    # The real run sits in the trash (cleaned up later); the debris has no status.
+    assert runs.read_status(run_id, root).state == "unreadable"
+    assert [p for p in root.iterdir() if p.name.startswith(runs.TRASH_PREFIX)]
 
 
 def test_delete_unreadable_run(root: Path) -> None:

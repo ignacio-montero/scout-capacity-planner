@@ -35,6 +35,7 @@ import logging
 import math
 import multiprocessing
 import os
+import shutil
 import signal
 import sys
 import threading
@@ -55,6 +56,8 @@ PROGRESS_MIN_INTERVAL_S = 0.5
 # How long a child gets to exit after SIGTERM before it gets SIGKILL.
 KILL_TIMEOUT_S = 5.0
 INTERRUPTED = "interrupted"  # status.error when the worker stopped mid-run (DATA_CONTRACTS)
+# After an unexpected error the loop waits poll_s, then doubles up to this.
+MAX_BACKOFF_S = 30.0
 
 log = logging.getLogger("scout_planner.worker")
 
@@ -193,6 +196,9 @@ def _child_main(root: str, run_id: str, pipeline_spec: str, progress_interval_s:
 
     root_path = Path(root)
     folder = runs.run_dir(run_id, root_path)
+    status_path = folder / runs.STATUS_FILE
+    if not status_path.exists():
+        return  # deleted between "running" and now; the worker records nothing
     _redirect_output_to(folder / runs.LOG_FILE)
     logging.basicConfig(
         level=logging.INFO,
@@ -205,6 +211,15 @@ def _child_main(root: str, run_id: str, pipeline_spec: str, progress_interval_s:
 
     parent_pid = os.getppid()
     orphaned = False
+    gone = False
+
+    def folder_gone() -> bool:
+        # The run was deleted while running (a stale-run delete, or a race).
+        # Stop at the next check instead of letting the pipeline's writers
+        # recreate the folder.
+        nonlocal gone
+        gone = gone or not status_path.exists()
+        return gone
 
     def should_cancel() -> bool:
         nonlocal orphaned
@@ -213,28 +228,45 @@ def _child_main(root: str, run_id: str, pipeline_spec: str, progress_interval_s:
         if os.getppid() != parent_pid:
             orphaned = True
             return True
-        return runs.cancel_requested(run_id, root_path)
+        return folder_gone() or runs.cancel_requested(run_id, root_path)
 
-    progress = ThrottledProgress(run_id, root_path, progress_interval_s)
+    throttled = ThrottledProgress(run_id, root_path, progress_interval_s)
+
+    def progress(fraction: float, stage: str, message: str) -> None:
+        # Progress is reported at every stage boundary, so it doubles as a
+        # cancellation point before the next stage writes anything.
+        if folder_gone():
+            raise RunCancelled("run folder was deleted")
+        throttled(fraction, stage, message)
+
     final: dict[str, Any]
     try:
         pipeline = load_pipeline(pipeline_spec)
         params = runs.read_params(run_id, root_path)
         pipeline(params, folder, progress, should_cancel)
     except RunCancelled:
-        if orphaned:
+        if folder_gone():
+            final = {}
+        elif orphaned:
             run_log.warning("worker is gone; stopping this run")
-            final = {**progress.latest(), "state": "failed", "error": INTERRUPTED}
+            final = {**throttled.latest(), "state": "failed", "error": INTERRUPTED}
         else:
             run_log.info("cancelled on request")
-            final = {**progress.latest(), "state": "cancelled"}
+            final = {**throttled.latest(), "state": "cancelled"}
     except Exception as exc:
         run_log.exception("run failed")
-        final = {**progress.latest(), "state": "failed", "error": _short_error(exc)}
+        final = {**throttled.latest(), "state": "failed", "error": _short_error(exc)}
     else:
         run_log.info("run finished")
         final = {"state": "done", "stage": None, "message": "finished"}
 
+    if folder_gone():
+        run_log.warning("run folder was deleted while running; discarding outputs")
+        # Pipeline writers may have recreated the folder (mkdir parents=True)
+        # after the delete: without status.json it is debris, not a run.
+        if folder.is_dir() and not status_path.exists():
+            shutil.rmtree(folder, ignore_errors=True)
+        return
     try:
         runs.update_status(run_id, root=root_path, **final)
     except (RunStoreError, OSError) as exc:
@@ -285,6 +317,147 @@ def _describe_exit(code: int | None) -> str:
     return f"exit code {code}"
 
 
+# --- the runs lock (one executor per runs folder) ----------------------------------
+
+
+@contextlib.contextmanager
+def runs_lock(
+    root: Path | str | None = None,
+    *,
+    wait: bool = False,
+    poll_s: float = DEFAULT_POLL_S,
+    should_stop: Callable[[], bool] | None = None,
+) -> Iterator[None]:
+    """Hold the exclusive lock on ``<root>/_worker.lock``: only one executor
+    (background worker or CLI) may move runs out of ``queued`` at a time.
+
+    The OS releases a ``flock`` when the process dies, however it dies, so a
+    crashed executor never leaves a stale lock behind (unlike a "pid file").
+    ``wait=False`` raises :class:`WorkerAlreadyRunning` at once if the lock is
+    taken; ``wait=True`` retries every ``poll_s`` until it gets it, or raises
+    once ``should_stop()`` returns True.
+    """
+    base = Path(root) if root is not None else runs.DEFAULT_ROOT
+    base.mkdir(parents=True, exist_ok=True)
+    fd = os.open(base / runs.LOCK_FILE, os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        announced = False
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if not wait or (should_stop is not None and should_stop()):
+                    raise WorkerAlreadyRunning(
+                        f"another worker or CLI run is executing runs in {base}"
+                    ) from None
+                if not announced:
+                    log.info("another worker or CLI run holds the lock on %s; waiting", base)
+                    announced = True
+                time.sleep(poll_s)
+        os.ftruncate(fd, 0)
+        os.write(fd, f"{os.getpid()}\n".encode())
+        yield
+    finally:
+        os.close(fd)  # closing the descriptor releases the lock
+
+
+class Lease:
+    """Heartbeat for an executor that runs the pipeline in its own process (the CLI).
+
+    A background thread rewrites ``_worker.json`` every ``interval_s``, so the
+    app shows a live executor and :func:`runs.run_is_live` protects the run
+    from deletion. Set :attr:`current_run` **before** marking a run
+    ``running``; setting it writes a heartbeat at once.
+    """
+
+    def __init__(self, root: Path, interval_s: float = DEFAULT_POLL_S) -> None:
+        self.root = root
+        self.interval_s = interval_s
+        self._current_run: str | None = None
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._loop, name="heartbeat", daemon=True)
+
+    @property
+    def current_run(self) -> str | None:
+        return self._current_run
+
+    @current_run.setter
+    def current_run(self, run_id: str | None) -> None:
+        self._current_run = run_id
+        self.beat()
+
+    def beat(self) -> None:
+        try:
+            runs.write_heartbeat(os.getpid(), self._current_run, self.root)
+        except OSError as exc:
+            log.warning("heartbeat not written: %s", exc)
+
+    def _loop(self) -> None:
+        while not self._stop.wait(self.interval_s):
+            self.beat()
+
+    def start(self) -> None:
+        self.beat()
+        self._thread.start()
+
+    def close(self) -> None:
+        self._stop.set()
+        if self._thread.is_alive():
+            self._thread.join(self.interval_s + 1)
+        with contextlib.suppress(OSError):
+            runs.remove_heartbeat(self.root, pid=os.getpid())
+
+
+@contextlib.contextmanager
+def executor_lease(root: Path | str | None = None, *, recover: bool = True) -> Iterator[Lease]:
+    """Become the runs folder's executor for the duration of the block (for the CLI).
+
+    Takes the runs lock (raises :class:`WorkerAlreadyRunning` if the
+    background worker or another CLI holds it), runs crash recovery (safe now:
+    nobody else can be executing), and keeps a heartbeat alive. Usage::
+
+        with worker.executor_lease(root) as lease:
+            lease.current_run = run_id        # before marking it running
+            pipeline.execute_run_inline(run_id, root, ...)
+            lease.current_run = None
+    """
+    base = Path(root) if root is not None else runs.DEFAULT_ROOT
+    with runs_lock(base):
+        lease = Lease(base)
+        lease.start()
+        try:
+            if recover:
+                Worker(base).recover()
+            yield lease
+        finally:
+            lease.close()
+
+
+def run_one_now(
+    run_id: str,
+    root: Path | str | None = None,
+    pipeline: str = DEFAULT_PIPELINE,
+    *,
+    poll_s: float = 0.2,
+    cancel_grace_s: float = DEFAULT_CANCEL_GRACE_S,
+) -> runs.RunStatus | None:
+    """Execute one queued run right now, exactly as the worker would (child
+    process, crash recovery, Ctrl-C -> interrupted), then return its final status.
+
+    Raises :class:`WorkerAlreadyRunning` if a background worker or another
+    CLI holds the runs lock. Returns None if the run was not queued any more.
+    """
+    worker = Worker(root, pipeline, poll_s=poll_s, cancel_grace_s=cancel_grace_s)
+    with runs_lock(worker.root), worker.signal_handlers():
+        worker.recover()
+        try:
+            return worker.execute(run_id)
+        finally:
+            with contextlib.suppress(OSError):
+                runs.remove_heartbeat(worker.root, pid=worker.pid)
+
+
 # --- the worker --------------------------------------------------------------------
 
 
@@ -310,6 +483,11 @@ class Worker:
         self._parent_pid = os.getppid()
         self._stop = threading.Event()
         self._mp = multiprocessing.get_context("spawn")
+        # Runs this worker could not even start (unwritable folder, disk full):
+        # skipped for the rest of this process's life so one bad folder can't
+        # stop the queue (the "poison pill" problem). Forgotten on restart.
+        self.skipped: dict[str, str] = {}
+        self._beat_failing = False
 
     # -- lifecycle --
 
@@ -323,28 +501,9 @@ class Worker:
             self._stop.set()
         return self._stop.is_set()
 
-    @contextlib.contextmanager
-    def exclusive(self) -> Iterator[None]:
-        """Hold an exclusive lock on ``<root>/_worker.lock`` for the worker's lifetime.
-
-        Two workers on one root would both pick the same queued run. The OS
-        releases a ``flock`` when the process dies, however it dies, so a crashed
-        worker never leaves a stale lock behind (unlike a "pid file").
-        """
-        self.root.mkdir(parents=True, exist_ok=True)
-        fd = os.open(self.root / runs.LOCK_FILE, os.O_RDWR | os.O_CREAT, 0o644)
-        try:
-            try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
-                raise WorkerAlreadyRunning(
-                    f"another worker is already running on {self.root}"
-                ) from None
-            os.ftruncate(fd, 0)
-            os.write(fd, f"{self.pid}\n".encode())
-            yield
-        finally:
-            os.close(fd)  # closing the descriptor releases the lock
+    def exclusive(self, wait: bool = False) -> contextlib.AbstractContextManager[None]:
+        """The runs lock (see :func:`runs_lock`); ``wait`` honours :meth:`stop`."""
+        return runs_lock(self.root, wait=wait, poll_s=self.poll_s, should_stop=self.stopping)
 
     @contextlib.contextmanager
     def signal_handlers(self) -> Iterator[None]:
@@ -372,13 +531,36 @@ class Worker:
     # -- queue steps (each one small and testable on its own) --
 
     def beat(self, current_run: str | None = None) -> None:
-        """Rewrite the heartbeat file."""
-        runs.write_heartbeat(self.pid, current_run, self.root)
+        """Rewrite the heartbeat file. Never raises: a full disk must not kill a run."""
+        try:
+            runs.write_heartbeat(self.pid, current_run, self.root)
+        except OSError as exc:
+            if not self._beat_failing:
+                log.warning("heartbeat not written: %s", exc)
+            self._beat_failing = True
+        else:
+            self._beat_failing = False
+
+    def _run_log(self, run_id: str, text: str) -> None:
+        """Best-effort line in the run's log.txt (never raises)."""
+        try:
+            runs.append_log(run_id, text, self.root)
+        except OSError as exc:
+            log.warning("could not write to log of %s: %s", run_id, exc)
 
     def recover(self) -> list[str]:
-        """Crash recovery: runs left ``running`` by a previous worker become ``failed``."""
+        """Crash recovery: runs left ``running`` by a previous executor become ``failed``.
+
+        Only call while holding the runs lock: otherwise a live executor's
+        run would be failed under its feet.
+        """
         recovered = []
-        for status in runs.list_runs(self.root):
+        try:
+            statuses = runs.list_runs(self.root)
+        except OSError as exc:
+            log.error("could not list runs for recovery: %s", exc)
+            return recovered
+        for status in statuses:
             if status.state != "running":
                 continue
             try:
@@ -386,20 +568,25 @@ class Worker:
             except (RunStoreError, OSError) as exc:
                 log.warning("could not recover %s: %s", status.run_id, exc)
                 continue
-            runs.append_log(
+            self._run_log(
                 status.run_id,
                 "worker restarted: this run was in progress and is marked failed (interrupted)",
-                self.root,
             )
             log.info("marked %s as failed (interrupted)", status.run_id)
             recovered.append(status.run_id)
-        runs.cleanup_stale_temp(self.root)
+        with contextlib.suppress(OSError):
+            runs.cleanup_stale_temp(self.root)
         return recovered
 
     def cancel_flagged_queued(self) -> list[str]:
         """Queued runs with a ``cancel`` flag go straight to ``cancelled`` (gap G4)."""
-        cancelled = []
-        for status in runs.queued_runs(self.root, include_cancel_requested=True):
+        cancelled: list[str] = []
+        try:
+            queued = runs.queued_runs(self.root, include_cancel_requested=True)
+        except OSError as exc:
+            log.warning("could not list queued runs: %s", exc)
+            return cancelled
+        for status in queued:
             if not runs.cancel_requested(status.run_id, self.root):
                 continue
             try:
@@ -417,9 +604,22 @@ class Worker:
         return cancelled
 
     def next_run(self) -> str | None:
-        """The oldest queued run without a cancel request, or None."""
-        queue = runs.queued_runs(self.root)
-        return queue[0].run_id if queue else None
+        """The oldest queued run without a cancel request (and not skipped), or None."""
+        for status in runs.queued_runs(self.root):
+            if status.run_id not in self.skipped:
+                return status.run_id
+        return None
+
+    def _skip(self, run_id: str, reason: str) -> None:
+        """Stop trying a run this worker can't start; mark it failed if at all possible."""
+        self.skipped[run_id] = reason
+        log.error("skipping %s from now on: %s", run_id, reason)
+        with contextlib.suppress(RunStoreError, OSError):
+            if runs.read_status(run_id, self.root).state == "queued":
+                runs.update_status(run_id, root=self.root, state="running")
+            runs.update_status(
+                run_id, root=self.root, state="failed", error=f"worker could not start it: {reason}"
+            )
 
     def poll_once(self) -> str | None:
         """One poll: heartbeat, cancel flagged queued runs, execute the oldest run.
@@ -438,6 +638,9 @@ class Worker:
 
     def execute(self, run_id: str) -> runs.RunStatus | None:
         """Run one queued run in a child process and make sure it ends in a final state."""
+        # Heartbeat first, then "running": a delete that sees the run running
+        # always also sees a heartbeat naming it (runs.run_is_live).
+        self.beat(run_id)
         try:
             runs.update_status(
                 run_id,
@@ -449,10 +652,15 @@ class Worker:
             )
         except (RunNotFound, IllegalTransition) as exc:
             log.warning("skipping %s: %s", run_id, exc)  # deleted or changed since we looked
+            self.skipped[run_id] = str(exc)
+            self.beat(None)
+            return None
+        except OSError as exc:
+            self._skip(run_id, f"{type(exc).__name__}: {exc}")
+            self.beat(None)
             return None
         log.info("running %s", run_id)
-        runs.append_log(run_id, f"worker pid {self.pid}: starting ({self.pipeline})", self.root)
-        self.beat(run_id)
+        self._run_log(run_id, f"worker pid {self.pid}: starting ({self.pipeline})")
 
         proc = self._mp.Process(
             target=_child_main,
@@ -527,11 +735,10 @@ class Worker:
             "state": "failed",
             "error": f"run process ended without a result ({_describe_exit(exitcode)})",
         }
-        runs.append_log(
+        self._run_log(
             run_id,
             f"worker: child {_describe_exit(exitcode)}; marking {changes['state']}"
             + (f" ({changes['error']})" if changes.get("error") else ""),
-            self.root,
         )
         try:
             status = runs.update_status(run_id, root=self.root, **changes)
@@ -544,31 +751,66 @@ class Worker:
     # -- loops --
 
     def serve_forever(self) -> None:
-        """The long-running loop used by ``make app``. Returns after a stop request."""
-        with self.exclusive(), self.signal_handlers():
-            self.recover()
-            log.info("worker %d watching %s (pipeline %s)", self.pid, self.root, self.pipeline)
+        """The long-running loop used by ``make app``. Returns after a stop request.
+
+        If another worker or a CLI run holds the runs lock, waits for it
+        (a standby worker) instead of exiting. Never exits on an error: it
+        logs, backs off (``poll_s`` doubling up to ``MAX_BACKOFF_S``) and retries.
+        """
+        with self.signal_handlers():
             try:
-                while not self.stopping():
-                    if self.poll_once() is None:
-                        self._stop.wait(self.poll_s)
-            finally:
+                with self.exclusive(wait=True):
+                    self._serve_locked()
+            except WorkerAlreadyRunning:
+                if not self._stop.is_set():
+                    raise
+                log.info("worker %d stopped while waiting for the lock", self.pid)
+
+    def _serve_locked(self) -> None:
+        self.recover()
+        log.info("worker %d watching %s (pipeline %s)", self.pid, self.root, self.pipeline)
+        backoff = self.poll_s
+        try:
+            while not self.stopping():
+                try:
+                    ran = self.poll_once()
+                except Exception:
+                    log.exception(
+                        "unexpected error in the worker loop; retrying in %.1f s", backoff
+                    )
+                    self._stop.wait(backoff)
+                    backoff = min(backoff * 2, MAX_BACKOFF_S)
+                    continue
+                backoff = self.poll_s
+                if ran is None:
+                    self._stop.wait(self.poll_s)
+        finally:
+            with contextlib.suppress(OSError):
                 runs.remove_heartbeat(self.root, pid=self.pid)
-                log.info("worker %d stopped", self.pid)
+            log.info("worker %d stopped", self.pid)
 
     def drain(self) -> list[str]:
-        """``--once``: recover, execute everything queued right now, then return."""
+        """``--once``: recover, execute everything queued right now, then return.
+
+        Does not wait for the lock (raises :class:`WorkerAlreadyRunning`).
+        Stops early on an unexpected error rather than retrying.
+        """
         executed: list[str] = []
         with self.exclusive(), self.signal_handlers():
             self.recover()
             try:
                 while not self.stopping():
-                    run_id = self.poll_once()
+                    try:
+                        run_id = self.poll_once()
+                    except Exception:
+                        log.exception("unexpected error; stopping the drain")
+                        break
                     if run_id is None:
                         break
                     executed.append(run_id)
             finally:
-                runs.remove_heartbeat(self.root, pid=self.pid)
+                with contextlib.suppress(OSError):
+                    runs.remove_heartbeat(self.root, pid=self.pid)
         return executed
 
 
@@ -615,7 +857,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     try:
         if args.once:
-            done = worker.drain()
+            done = worker.drain()  # does not wait for the lock
             log.info("executed %d run(s)", len(done))
         else:
             worker.serve_forever()

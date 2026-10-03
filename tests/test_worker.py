@@ -22,13 +22,17 @@ import pytest
 
 from scout_planner import runs, serve, worker
 from scout_planner.config import Params
+from scout_planner.errors import RunStoreError
 from scout_planner.worker import (
     INTERRUPTED,
     PipelineUnavailable,
     ThrottledProgress,
     Worker,
     WorkerAlreadyRunning,
+    executor_lease,
     load_pipeline,
+    run_one_now,
+    runs_lock,
 )
 
 TESTS_DIR = Path(__file__).resolve().parent
@@ -346,6 +350,206 @@ def test_drain_runs_queue_oldest_first_and_survives_failures(root: Path) -> None
     assert runs.read_heartbeat(root) is None  # removed on clean exit
 
 
+# --- robustness: poison pills, failing writes, the loop never dies -----------------
+
+
+@pytest.fixture
+def read_only(tmp_path: Path) -> Iterator[Callable[[Path], None]]:
+    locked: list[Path] = []
+
+    def lock(path: Path) -> None:
+        path.chmod(0o555)
+        locked.append(path)
+
+    yield lock
+    for path in locked:
+        path.chmod(0o755)
+
+
+def test_unwritable_run_folder_is_skipped_not_fatal(
+    root: Path, read_only: Callable[[Path], None]
+) -> None:
+    poisoned = queue(root, "poisoned", T0)
+    healthy = queue(root, "healthy", T0 + timedelta(seconds=1))
+    read_only(root / poisoned)
+
+    w = make_worker(root, "succeed")
+    assert w.poll_once() == poisoned  # tried, did not raise
+    assert poisoned in w.skipped
+    assert state(root, poisoned).state == "queued"  # can't even be marked failed
+    assert w.poll_once() == healthy  # the queue moves on
+    assert state(root, healthy).state == "done"
+    assert w.next_run() is None
+
+
+def test_oserror_starting_a_run_marks_it_failed_when_possible(
+    root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run_id = queue(root, "flaky disk")
+    real_update = runs.update_status
+    calls = {"n": 0}
+
+    def flaky(rid: str, /, **kw: object) -> runs.RunStatus:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise OSError(28, "No space left on device")
+        return real_update(rid, **kw)
+
+    monkeypatch.setattr(runs, "update_status", flaky)
+    w = make_worker(root, "succeed")
+    w.poll_once()
+    assert run_id in w.skipped
+    status = state(root, run_id)
+    assert status.state == "failed"
+    assert "No space left on device" in (status.error or "")
+
+
+def test_failing_log_and_heartbeat_writes_do_not_break_runs(
+    root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def broken(*_a: object, **_k: object) -> None:
+        raise PermissionError("read-only")
+
+    left_running = queue(root, "left running", T0)
+    runs.update_status(left_running, root=root, state="running")
+    crashing = queue(root, "crashes", T0 + timedelta(seconds=1))
+    monkeypatch.setattr(runs, "append_log", broken)
+    monkeypatch.setattr(runs, "write_heartbeat", broken)
+
+    w = make_worker(root, "crash")
+    assert w.recover() == [left_running]
+    w.poll_once()
+    assert state(root, crashing).state == "failed"  # _finalise still recorded it
+    assert "exit code 7" in (state(root, crashing).error or "")
+
+
+def _serve_in_thread(w: Worker) -> threading.Thread:
+    thread = threading.Thread(target=w.serve_forever, daemon=True)
+    thread.start()
+    return thread
+
+
+def test_serve_loop_survives_unexpected_errors(root: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    w = make_worker(root, "succeed")
+    real_poll = w.poll_once
+    failures = {"left": 3}
+
+    def sometimes_broken() -> str | None:
+        if failures["left"]:
+            failures["left"] -= 1
+            raise OSError("runs folder temporarily unreadable")
+        return real_poll()
+
+    monkeypatch.setattr(w, "poll_once", sometimes_broken)
+    thread = _serve_in_thread(w)
+    run_id = queue(root, "after the errors")
+    try:
+        assert wait_until(lambda: state(root, run_id).state == "done", timeout=20)
+        assert thread.is_alive()
+        assert failures["left"] == 0
+    finally:
+        w.stop()
+        thread.join(10)
+    assert not thread.is_alive()
+
+
+def test_serving_worker_waits_for_the_lock_as_standby(root: Path) -> None:
+    run_id = queue(root, "waits for the lock")
+    w = make_worker(root, "succeed")
+    with runs_lock(root):  # e.g. a CLI run in progress
+        thread = _serve_in_thread(w)
+        time.sleep(0.5)
+        assert thread.is_alive()
+        assert state(root, run_id).state == "queued"
+    try:
+        assert wait_until(lambda: state(root, run_id).state == "done", timeout=20)
+    finally:
+        w.stop()
+        thread.join(10)
+
+
+def test_worker_stops_while_waiting_for_the_lock(root: Path) -> None:
+    w = make_worker(root, "succeed")
+    with runs_lock(root):
+        thread = _serve_in_thread(w)
+        time.sleep(0.2)
+        w.stop()
+        thread.join(5)
+        assert not thread.is_alive()
+
+
+def test_run_folder_deleted_mid_run_is_not_resurrected(root: Path) -> None:
+    run_id = queue(root, "vanishing", T0)
+    after = queue(root, "next", T0 + timedelta(seconds=1))
+    w = make_worker(root, "vanish")
+    assert w.execute(run_id) is None  # nothing to record: the run is gone
+    assert not (root / run_id).exists(), "pipeline writer debris was left behind"
+    assert w.next_run() == after
+
+
+def test_deleting_the_run_being_executed_is_refused(root: Path) -> None:
+    run_id = queue(root, "busy")
+    outcome: dict[str, object] = {}
+
+    def try_delete() -> None:
+        assert wait_until(lambda: (root / run_id / "fake_started.txt").exists())
+        try:
+            runs.delete_run(run_id, root)
+        except RunStoreError as exc:
+            outcome["error"] = exc
+        runs.request_cancel(run_id, root)
+
+    _in_background(try_delete)
+    make_worker(root, "wait_for_cancel").poll_once()
+    assert isinstance(outcome.get("error"), RunStoreError)
+    assert state(root, run_id).state == "cancelled"
+
+
+# --- helpers for the CLI: executor_lease and run_one_now ----------------------------
+
+
+def test_executor_lease_locks_recovers_and_beats(root: Path) -> None:
+    stale = queue(root, "stale", T0)
+    runs.update_status(stale, root=root, state="running")
+    run_id = queue(root, "cli run", T0 + timedelta(seconds=1))
+
+    with executor_lease(root) as lease:
+        assert state(root, stale).error == INTERRUPTED  # recovered on entry
+        with pytest.raises(WorkerAlreadyRunning), make_worker(root).exclusive():
+            pass
+        lease.current_run = run_id
+        runs.update_status(run_id, root=root, state="running")
+        assert runs.worker_alive(root)
+        assert runs.run_is_live(run_id, root)
+        with pytest.raises(RunStoreError):
+            runs.delete_run(run_id, root)
+        runs.update_status(run_id, root=root, state="done")
+        lease.current_run = None
+    assert runs.read_heartbeat(root) is None
+    with make_worker(root).exclusive():  # released
+        pass
+
+
+def test_executor_lease_refused_while_a_worker_holds_the_lock(root: Path) -> None:
+    with make_worker(root).exclusive(), pytest.raises(WorkerAlreadyRunning), executor_lease(root):
+        pass
+
+
+def test_run_one_now(root: Path) -> None:
+    run_id = queue(root, "now")
+    status = run_one_now(run_id, root, "fake_pipelines:succeed")
+    assert status is not None and status.state == "done"
+    assert runs.read_heartbeat(root) is None
+    assert run_one_now(run_id, root, "fake_pipelines:succeed") is None  # not queued any more
+
+
+def test_run_one_now_refuses_while_a_worker_runs(root: Path) -> None:
+    run_id = queue(root, "blocked")
+    with runs_lock(root), pytest.raises(WorkerAlreadyRunning):
+        run_one_now(run_id, root, "fake_pipelines:succeed")
+    assert state(root, run_id).state == "queued"
+
+
 # --- integration: real worker / serve processes ------------------------------------
 
 
@@ -480,16 +684,18 @@ def test_serve_stops_the_worker_when_the_app_exits(root: Path, tmp_path: Path) -
 
 
 @pytest.mark.slow
-def test_serve_reuses_a_live_worker(
+def test_serve_with_a_live_worker_keeps_it(
     root: Path, start_worker: Callable[[], subprocess.Popen[bytes]]
 ) -> None:
     existing = start_worker()
     code = serve.main(
         ["--root", str(root)],
-        app_cmd=[sys.executable, "-c", "pass"],
+        app_cmd=[sys.executable, "-c", "import time; time.sleep(1)"],
     )
     assert code == 0
-    # serve did not start (or stop) a worker of its own: the existing one lives on.
+    # serve's own worker only waited as a standby and was stopped with the app;
+    # the existing worker kept the lock and lives on.
     assert existing.poll() is None
     beat = runs.read_heartbeat(root)
     assert beat is not None and beat.pid == existing.pid
+    assert runs.worker_alive(root)

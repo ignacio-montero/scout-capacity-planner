@@ -104,3 +104,17 @@ def by_name(params: Params, run_dir: Path, progress: Progress, should_cancel: Sh
         fail(params, run_dir, progress, should_cancel)
     else:
         succeed(params, run_dir, progress, should_cancel)
+
+
+def vanish(params: Params, run_dir: Path, progress: Progress, should_cancel: ShouldCancel) -> None:
+    """The run folder is deleted mid-run, then a stage writer recreates it.
+
+    Mimics ``delete_run`` (rename to a trash name) racing a pipeline whose
+    writers call ``mkdir(parents=True)``. The next progress report must stop it.
+    """
+    progress(0.1, "generate", "writing the world")
+    run_dir.rename(run_dir.parent / f"_trash-{run_dir.name}")
+    (run_dir / "raw").mkdir(parents=True)  # a writer resurrecting the folder
+    (run_dir / "raw" / "scouts.parquet").write_bytes(b"partial")
+    progress(0.2, "forecast", "should never get here")
+    _mark(run_dir, "fake_result.txt")
