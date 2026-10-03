@@ -34,11 +34,11 @@ format:  ## auto-format and apply safe lint fixes
 data:  ## [1] synthetic world -> $(DEV_RUN)/raw/*.parquet
 	uv run python -m scout_planner.cli data --params $(PARAMS) --out $(DEV_RUN)
 
-forecast:
-	$(call todo,M2)
+forecast:  ## [2] demand forecast + backtest -> $(DEV_RUN)/{forecast,backtest}.parquet
+	uv run python -m scout_planner.cli forecast --run $(DEV_RUN)
 
-plan:
-	$(call todo,M2)
+plan:  ## [3] capacity plan + hiring table -> $(DEV_RUN)/{capacity_plan,hiring_plan}.parquet
+	uv run python -m scout_planner.cli plan --run $(DEV_RUN)
 
 simulate:
 	$(call todo,M4)
