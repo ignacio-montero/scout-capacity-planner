@@ -7,7 +7,7 @@ its invariants easy to test. ``simulate_replication(inputs)`` is pure: same
 inputs, same result; no file access. The process pool, progress relay and
 file writing live in ``pipeline.py`` (the imperative shell).
 
-What one replication is (orchestrator decision, D-023 draft)
+What one replication is (orchestrator decision, D-024)
 ------------------------------------------------------------
 ``sim.seeds = N`` replications vary *luck*, not *decisions*:
 

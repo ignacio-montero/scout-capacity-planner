@@ -18,7 +18,7 @@ How the forecast is built
   additive yearly seasonality *in logs*, i.e. multiplicative in counts.
   Demand is multiplicative (season x trend), so additive seasonality on raw
   counts under-forecast the January peak by ~13% and broke down when the
-  history's level changed a lot (D-021). All-additive models have *exact*
+  history's level changed a lot (D-023). All-additive models have *exact*
   prediction intervals, so there is no simulation and no extra randomness;
   in logs they become lognormal. Point forecasts are expected values
   ``exp(mu + sd^2 / 2)``, not the median ``exp(mu)``.

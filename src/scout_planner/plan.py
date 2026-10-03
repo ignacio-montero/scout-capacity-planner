@@ -29,7 +29,7 @@ required work the current team can cover; whatever is left is the true
 shortfall. A fixed split of each scout's hours (e.g. by demand share) would
 leave spare hours stranded on one skill while another skill nobody else can
 cover looks short: *phantom gaps* that make the plan hire people the team
-does not need (D-021).
+does not need (D-023).
 
 Ties: when several skills compete for the same scouts and not all can be
 covered, arc costs make the flow cover the skills with the smaller requirement
