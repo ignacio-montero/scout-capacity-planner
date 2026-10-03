@@ -20,16 +20,24 @@ Hard constraints
       ``eligibility.py``). Its last day is the plain window-total cap. Without
       the per-day part, the model believed 10 h due tomorrow fit in a 37.5 h
       week and counted it as on time;
-    * at most one live view per scout per date (a live view takes the day, D-008).
+    * at most one live view per scout per date (a live view takes the day, D-008);
+    * **commitment horizon** (``assignment.commit_buffer_days``, default 2):
+      non-live work is only committed if the scout can finish it within that
+      many days after the next run; the rest stays in the pool. See
+      :func:`commit_index`.
 
 Objective (minimise, in cost units)
     * **lateness**: ``cost.late_penalty x weights.lateness x urgency`` per
       *request* left (partly) unassigned, shared across the request's pool
       items by hours. One late request costs about one late penalty however
       many tasks it has. See :func:`urgency` and :func:`lateness_penalties`.
-    * **cost**: ``weights.cost x freelance hours x the freelancer's hourly
-      rate``. Salaried hours cost 0 here: salaries are paid whether the scout
-      is busy or not (a *sunk cost*), so only freelance hours change the bill.
+      With ``assignment.load_aware`` (default on) the slack is reduced by the
+      wait behind earlier-due work of the same skill (:func:`queue_wait_days`).
+    * **cost**: ``weights.cost x freelance hours x a per-hour price``: the
+      premium over a salaried hour (``assignment.cost_basis: premium``,
+      default) or the full rate (``full``), plus a tiny salaried-first
+      tie-break. Salaried hours cost 0 here: salaries are paid whether the
+      scout is busy or not (a *sunk cost*). See :func:`hourly_cost`.
     * **continuity**: ``weights.continuity`` per extra scout on one request (a
       desk review and a write-up by different scouts means a hand-over).
       Scouts already on the request outside the pool come in through
@@ -88,7 +96,7 @@ import datetime as dt
 import logging
 import math
 from collections import defaultdict
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
 import numpy as np
@@ -117,6 +125,7 @@ URGENCY_ZERO_SLACK = 1.0  # last chance to be on time: one full late penalty
 URGENCY_OVERDUE = 1.25  # already late: ranked above any still-savable request
 URGENCY_LOST_FIXTURE = URGENCY_OVERDUE  # a live view whose match is gone after this run
 RUN_INTERVAL_DAYS = {"daily": 1, "weekly": 7}  # days until the next assignment run
+SALARIED_TIE_BREAK = 0.01  # cost units per freelance hour: equal work goes to salaried first
 
 
 def wall_clock_cap(time_limit_s: float) -> float:
@@ -156,7 +165,7 @@ def slack_days(due_date: dt.date, today: dt.date, work_days: int) -> int:
     return (due_date - today).days + 1 - work_days
 
 
-def urgency(slack: int, *, overdue: bool) -> float:
+def urgency(slack: float, *, overdue: bool) -> float:
     """Share of a late penalty at stake if the request waits: 0 < urgency <= 1.25.
 
     ``1 / (1 + slack)`` for slack >= 0: 1.0 at zero slack (the last chance to
@@ -181,6 +190,26 @@ def next_run_date(window: AssignmentWindow, cfg: AssignmentParams) -> dt.date:
     return window.start + dt.timedelta(days=RUN_INTERVAL_DAYS[cfg.cadence])
 
 
+def commit_index(window: AssignmentWindow, cfg: AssignmentParams) -> int | None:
+    """Last window-day index by which committed non-live work must be finished.
+
+    ``assignment.commit_buffer_days`` days after the next run (daily cadence,
+    buffer 2: by the end of the day after tomorrow); ``None`` = the whole window.
+
+    Why: the model plans a week, but nothing is gained by *committing* work
+    that will only start in five days; tomorrow's run sees more (new
+    arrivals, finished work, rework) and can still place it. Committing the
+    whole window also made the optimiser indifferent between starting a desk
+    review today and on day 6 (both "finish by the due date"), so it parked
+    work late and lost the buffer the write-up needed (M3 calibration). This
+    is the standard rolling-horizon rule: plan over the horizon, commit only
+    the first period (*frozen zone* / *commitment horizon*).
+    """
+    if cfg.commit_buffer_days is None:
+        return None
+    return RUN_INTERVAL_DAYS[cfg.cadence] - 1 + cfg.commit_buffer_days
+
+
 def is_perishable(item: WorkItem, next_run: dt.date) -> bool:
     """A live view whose fixture is before the next run: assign it now or lose the match."""
     return item.fixed_date is not None and item.fixed_date < next_run
@@ -192,6 +221,7 @@ def lateness_penalties(
     next_run: dt.date,
     late_penalty: float,
     weight: float,
+    waits: Mapping[str, float] | None = None,
 ) -> dict[str, float]:
     """Cost units at stake per item if it is left unassigned this run.
 
@@ -213,6 +243,8 @@ def lateness_penalties(
     for items in by_request.values():
         due = min(i.due_date for i in items)
         slack = slack_days(due, today, remaining_work_days(items, today))
+        if waits is not None:
+            slack -= waits.get(items[0].request_id, 0.0)
         at_stake = late_penalty * weight * urgency(slack, overdue=due < today)
         total_hours = sum(i.hours for i in items)
         for i in items:
@@ -223,13 +255,89 @@ def lateness_penalties(
     return result
 
 
-def hourly_cost(scout: Scout) -> float:
-    """Marginal cost of one more hour: 0 for salaried scouts, the rate for freelancers."""
+def queue_wait_days(
+    pool: Sequence[WorkItem], scouts: Sequence[ScoutState], window: AssignmentWindow
+) -> dict[str, float]:
+    """Days each request would wait behind earlier-due work for its skill (load-aware slack).
+
+    A fluid picture of each skill's queue, served earliest-due-first by the
+    *salaried* scouts who hold the skill:
+
+    * capacity per calendar day = each salaried scout's window hours / window
+      days, split equally across the scout's skills (a simplification: a
+      three-skill scout counts a third towards each);
+    * work ahead of a request = hours of pool items of the same skill from
+      other requests due on or before its due date, plus the salaried
+      scouts' frozen hours split the same way;
+    * wait = work ahead / capacity per day.
+
+    Salaried capacity on purpose: deferring a job only saves the freelance
+    premium if a salaried scout will get to it in time. When the salaried
+    queue is long, the wait eats the slack, urgency rises, and a free
+    freelancer is used now instead of being left idle. A skill no salaried
+    scout holds falls back to all scouts' capacity; no capacity at all -> 0.
+    """
+    salaried_cap: defaultdict[str, float] = defaultdict(float)
+    any_cap: defaultdict[str, float] = defaultdict(float)
+    frozen: defaultdict[str, float] = defaultdict(float)
+    for st in scouts:
+        share = 1.0 / len(st.scout.skills)
+        per_day = st.window_hours / window.n_days * share
+        for k in st.scout.skills:
+            any_cap[k] += per_day
+            if not st.scout.is_freelance:
+                salaried_cap[k] += per_day
+                frozen[k] += st.frozen_hours * share
+    by_skill: defaultdict[str, list[WorkItem]] = defaultdict(list)
+    for item in pool:
+        by_skill[item.skill_type].append(item)
+    waits: dict[str, float] = {}
+    for k, items in by_skill.items():
+        cap = salaried_cap[k] if salaried_cap[k] > 0 else any_cap[k]
+        if cap <= 0:
+            continue
+        per_request: defaultdict[str, float] = defaultdict(float)
+        due_of: dict[str, dt.date] = {}
+        for i in items:
+            per_request[i.request_id] += i.hours
+            due_of[i.request_id] = i.due_date
+        ordered = sorted(per_request, key=lambda r: (due_of[r], r))
+        # Work due on or before each due date (ties included), minus the request's own.
+        by_due: defaultdict[dt.date, float] = defaultdict(float)
+        for r in ordered:
+            by_due[due_of[r]] += per_request[r]
+        running, upto = frozen[k], {}
+        for d in sorted(by_due):
+            running += by_due[d]
+            upto[d] = running
+        for r in ordered:
+            waits[r] = (upto[due_of[r]] - per_request[r]) / cap
+    return waits
+
+
+def hourly_cost(scout: Scout, basis: str = "full", salaried_hourly: float = 0.0) -> float:
+    """What one more hour of this scout costs in the objective.
+
+    Salaried scouts: 0 (salary is sunk). Freelancers, by ``assignment.cost_basis``:
+
+    * ``full``: the hourly rate. Treats "not assigned today" as "not paid for",
+      which is only true if a salaried scout does the work later.
+    * ``premium``: rate - salaried hourly equivalent (never below 0). The work
+      has to be done by someone; giving it to a freelancer instead of waiting
+      for a salaried scout only costs the *difference*. Comparing the full
+      rate with the lateness penalty made the optimiser defer work a
+      freelancer could do today, which then collided with tomorrow's equally
+      full capacity (M4 calibration: 89% on time vs EDF's 97% at 4x growth).
+
+    Plus, for every freelance hour, :data:`SALARIED_TIE_BREAK`, so that equal
+    work prefers a salaried scout even when the premium is 0.
+    """
     if not scout.is_freelance:
         return 0.0
     if scout.hourly_rate is None:
         raise ValueError(f"freelance scout {scout.scout_id} has no hourly_rate")
-    return scout.hourly_rate
+    rate = scout.hourly_rate if basis == "full" else max(0.0, scout.hourly_rate - salaried_hourly)
+    return rate + SALARIED_TIE_BREAK
 
 
 # --- the solve ---------------------------------------------------------------------
@@ -277,10 +385,11 @@ def solve_assignment(
     states = {s.scout_id: s for s in scouts}
     free = {s.scout_id: free_by_day(s, window) for s in scouts}
     units = {i.item_id: scaled_hours(i.hours) for i in pool}
+    commit_by = commit_index(window, cfg)
     deadline: dict[tuple[str, str], int] = {}
     for item_id, allowed in eligible_scouts(pool, scouts, window).items():
         for state in allowed:
-            j = deadline_index(items[item_id], free[state.scout_id], window)
+            j = deadline_index(items[item_id], free[state.scout_id], window, commit_by=commit_by)
             if j is not None:
                 deadline[item_id, state.scout_id] = j
     if not deadline:
@@ -313,17 +422,22 @@ def solve_assignment(
                 model.add_at_most_one(x[i, scout_id] for i in same_day)
 
     # Objective.
+    waits = queue_wait_days(pool, scouts, window) if cfg.load_aware else None
     late = lateness_penalties(
-        pool, window.start, next_run_date(window, cfg), cost.late_penalty, w.lateness
+        pool, window.start, next_run_date(window, cfg), cost.late_penalty, w.lateness, waits
     )
     churn = round(OBJECTIVE_SCALE * w.churn)
+    rate = {
+        sid: hourly_cost(st.scout, cfg.cost_basis, cost.salaried_hourly_equivalent)
+        for sid, st in states.items()
+    }
     terms: list[cp_model.LinearExprT] = []
     for item_id, scout_ids in by_item.items():
         item = items[item_id]
         assigned = sum(x[item_id, s] for s in scout_ids)
         terms.append(round(OBJECTIVE_SCALE * late[item_id]) * (1 - assigned))
         for s in scout_ids:
-            pay = round(OBJECTIVE_SCALE * w.cost * hourly_cost(states[s].scout) * item.hours)
+            pay = round(OBJECTIVE_SCALE * w.cost * rate[s] * item.hours)
             if pay:
                 terms.append(pay * x[item_id, s])
         current = (item_id, item.current_scout_id)

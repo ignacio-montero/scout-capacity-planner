@@ -1,0 +1,12 @@
+# M3 calibration (optimiser vs EDF), paired in one sweep so both run on the same
+# code and the same worlds. Scenarios: flat demand, 2x and 4x growth, with and
+# without following the hiring plan (2x without hiring = the tight case).
+name: optimiser_eval
+base: config/default.yaml
+vary:
+  demand.actual_growth: [1.0, 2.0, 4.0]
+  team.follow_hiring_plan: [true, false]
+  assignment.policy: [edf, optimiser]
+fixed:
+  sim.seeds: 3
+  assignment.time_limit_s: 1.0

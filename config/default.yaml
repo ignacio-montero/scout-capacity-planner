@@ -53,7 +53,9 @@ assignment:                    # daily who-does-which-work decision (D-010, D-01
     continuity: 5.0
     churn: 3.0
   time_limit_s: 1.0            # max seconds per optimiser solve
-  cost_basis: full             # optimiser: freelance hour priced at full | premium (rate - salaried equivalent)
+  cost_basis: premium          # optimiser: freelance hour priced at full | premium (rate - salaried equivalent)
+  commit_buffer_days: 2        # optimiser: commit work finishable by next run + N days; null = whole window
+  load_aware: true             # optimiser: urgency counts the wait behind earlier-due work of the skill
 
 cost:
   full_time_monthly_salary: 4500.0

@@ -162,10 +162,19 @@ class AssignmentParams(_StrictModel):
     horizon_days: int = Field(7, ge=1, le=14)
     weights: AssignmentWeights = AssignmentWeights()
     time_limit_s: float = Field(1.0, ge=0.1, le=10.0)
-    # Optimiser only (advanced): what a freelance hour costs in the objective.
-    # "full" = the hourly rate; "premium" = rate - salaried hourly equivalent
-    # (the work must be done by someone; deferring only saves the premium).
-    cost_basis: Literal["full", "premium"] = "full"
+    # Optimiser only (advanced). Defaults chosen by the M3 calibration sweep
+    # (config/sweeps/optimiser_eval*.yaml); the old behaviour is full / None / False.
+    # What a freelance hour costs in the objective: "full" = the hourly rate;
+    # "premium" = rate - salaried hourly equivalent (the work must be done by
+    # someone; deferring it only saves the premium).
+    cost_basis: Literal["full", "premium"] = "premium"
+    # Commit only non-live work a scout can finish within this many days after
+    # the next assignment run; the rest stays in the pool for the next run.
+    # None = commit anything that fits the whole window.
+    commit_buffer_days: int | None = Field(2, ge=0, le=14)
+    # Urgency uses slack minus the wait behind earlier-due work of the same
+    # skill on the salaried team (so deferral looks expensive when queues are long).
+    load_aware: bool = True
 
 
 class CostParams(_StrictModel):

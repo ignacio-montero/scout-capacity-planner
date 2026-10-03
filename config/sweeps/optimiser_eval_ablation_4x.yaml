@@ -1,0 +1,15 @@
+# Which optimiser setting matters? Every on/off combination of the three
+# calibration switches at the default 4x growth with the hiring plan. EDF rows
+# repeat (the switches do not affect it): a built-in sanity check.
+name: optimiser_eval_ablation_4x
+base: config/default.yaml
+vary:
+  assignment.policy: [edf, optimiser]
+  assignment.cost_basis: [full, premium]
+  assignment.commit_buffer_days: [null, 2]
+  assignment.load_aware: [false, true]
+fixed:
+  demand.actual_growth: 4.0
+  team.follow_hiring_plan: true
+  sim.seeds: 3
+  assignment.time_limit_s: 1.0

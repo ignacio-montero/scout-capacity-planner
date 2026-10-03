@@ -64,7 +64,9 @@ SPEC_DEFAULTS: dict[str, Any] = {
     "assignment.weights.continuity": 5,
     "assignment.weights.churn": 3,
     "assignment.time_limit_s": 1.0,
-    "assignment.cost_basis": "full",
+    "assignment.cost_basis": "premium",
+    "assignment.commit_buffer_days": 2,
+    "assignment.load_aware": True,
     "cost.full_time_monthly_salary": 4500,
     "cost.freelance_premium": 1.5,
     "cost.late_penalty": 1000,
@@ -185,6 +187,9 @@ def test_non_mapping_yaml_is_rejected() -> None:
         ("assignment.horizon_days", 15),
         ("assignment.time_limit_s", 0.05),
         ("assignment.cost_basis", "half"),
+        ("assignment.commit_buffer_days", -1),
+        ("assignment.commit_buffer_days", 2.0),  # strict: not an int
+        ("assignment.load_aware", "yes"),
         ("assignment.weights.lateness", 0),  # must be > 0
         ("assignment.weights.lateness", 10.5),
         ("cost.full_time_monthly_salary", 0),

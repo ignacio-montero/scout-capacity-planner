@@ -31,9 +31,19 @@ D0 = dt.date(2027, 3, 1)  # a Monday
 WINDOW = AssignmentWindow.starting(D0, 7)
 SAT = D0 + dt.timedelta(days=5)
 COST = CostParams()  # late penalty 1000 per report
-# Lateness weight pinned to 1.0 (one late penalty at zero slack), so these tests
-# do not depend on the default in config.py.
-CFG = AssignmentParams(weights=AssignmentWeights(lateness=1.0))
+# The *plain* model, pinned so each mechanism is tested on its own arithmetic and
+# the tests don't move with config defaults: lateness weight 1.0 (one late penalty
+# at zero slack), freelance hours at the full rate, commit anything that fits the
+# window, urgency from own slack only. The calibrated defaults (premium, commit
+# horizon, load-aware) have their own tests below and are used by the random,
+# order, time-limit and benchmark tests via DEFAULTS.
+CFG = AssignmentParams(
+    weights=AssignmentWeights(lateness=1.0),
+    cost_basis="full",
+    commit_buffer_days=None,
+    load_aware=False,
+)
+DEFAULTS = AssignmentParams()
 ALL = sorted(POLICIES)
 GREEDY = ["edf", "fcfs"]
 
@@ -316,12 +326,13 @@ def test_started_work_is_frozen_not_in_the_pool(name: str) -> None:
 def test_random_instances_never_break_a_hard_constraint(name: str, seed: int) -> None:
     pool, scouts = random_instance(120, 25, seed)
     run(name, pool, scouts, CFG.model_copy(update={"time_limit_s": 0.2}))
+    run(name, pool, scouts, DEFAULTS.model_copy(update={"time_limit_s": 0.2}))
 
 
 @pytest.mark.parametrize("name", ALL)
 def test_answer_does_not_depend_on_input_order(name: str) -> None:
     pool, scouts = random_instance(120, 25, seed=4)
-    cfg = CFG.model_copy(update={"time_limit_s": 0.2})
+    cfg = DEFAULTS.model_copy(update={"time_limit_s": 0.2})
     forward = answer_of(name, pool, scouts, cfg)
     backward = answer_of(name, pool[::-1], scouts[::-1], cfg)
     assert forward == backward
@@ -442,6 +453,110 @@ def test_optimiser_uses_a_freelancer_for_urgent_work_only() -> None:
     assert run("optimiser", relaxed, freelancer) == {}
     # With cost weighted at zero, any work is worth doing now.
     assert run("optimiser", relaxed, freelancer, weights(cost=0.0)) == {"T00001-desk": "S001"}
+
+
+def test_premium_cost_basis_hires_a_freelancer_earlier() -> None:
+    """Slack 10: ~91 at stake. Full rate 6 h x 40 = 240 > 91: wait. The premium
+    over a salaried hour (40 - 27.7 = 12.3/h, ~74) < 91: do it now."""
+    pool = [make_item("T00001-desk", hours=6.0, due=day(10))]
+    freelancer = [make_state("S001", freelance=True, rate=40.0)]
+    assert run("optimiser", pool, freelancer) == {}
+    premium = CFG.model_copy(update={"cost_basis": "premium"})
+    assert run("optimiser", pool, freelancer, premium) == {"T00001-desk": "S001"}
+
+
+def test_hourly_cost_by_basis() -> None:
+    freelancer = make_state("S001", freelance=True, rate=40.0).scout
+    salaried = make_state("S002").scout
+    tie = opt.SALARIED_TIE_BREAK
+    assert opt.hourly_cost(salaried, "premium", 27.7) == 0.0
+    assert opt.hourly_cost(freelancer, "full", 27.7) == pytest.approx(40.0 + tie)
+    assert opt.hourly_cost(freelancer, "premium", 27.7) == pytest.approx(12.3 + tie)
+    cheap = make_state("S003", freelance=True, rate=20.0).scout
+    assert opt.hourly_cost(cheap, "premium", 27.7) == pytest.approx(tie)  # never below 0
+
+
+def test_salaried_first_even_when_the_premium_is_zero() -> None:
+    """A freelancer as cheap as a salaried hour: the tie-break still picks salaried."""
+    pool = [make_item("T00001-desk")]
+    freelancer = make_state("S001", freelance=True, rate=20.0)  # below 27.7: premium 0
+    salaried = make_state("S002", weekday_hours=1.0)
+    premium = CFG.model_copy(update={"cost_basis": "premium"})
+    assert run("optimiser", pool, [freelancer, salaried], premium) == {"T00001-desk": "S002"}
+
+
+def test_commit_horizon_limits_how_far_ahead_work_is_committed() -> None:
+    """Four 6 h items due in 10 days, one scout with 7.5 h a day (daily cadence):
+    commit what can be finished by tomorrow + buffer days, keep the rest pooled."""
+    pool = [make_item(f"T0000{k}-desk", hours=6.0) for k in (1, 2, 3, 4)]
+    scouts = [make_state("S001")]
+    by_buffer = {
+        b: len(run("optimiser", pool, scouts, CFG.model_copy(update={"commit_buffer_days": b})))
+        for b in (0, 1, 2, None)
+    }
+    assert by_buffer == {0: 1, 1: 2, 2: 3, None: 4}  # 7.5 h, 15 h, 22.5 h, 37.5 h
+
+
+def test_commit_horizon_follows_cadence_and_spares_live_views() -> None:
+    assert opt.commit_index(WINDOW, CFG.model_copy(update={"commit_buffer_days": 2})) == 2
+    weekly = CFG.model_copy(update={"cadence": "weekly", "commit_buffer_days": 0})
+    assert opt.commit_index(WINDOW, weekly) == 6  # next run in 7 days: whole window
+    assert opt.commit_index(WINDOW, CFG) is None
+    # A live view later in the window is still taken: it happens on its date.
+    pool = [make_item("T00001-live", live_on=day(5))]
+    tight = CFG.model_copy(update={"commit_buffer_days": 0})
+    assert run("optimiser", pool, [make_state("S001")], tight) == {"T00001-live": "S001"}
+
+
+def test_queue_wait_days_counts_earlier_due_work_on_the_salaried_team() -> None:
+    salaried = make_state("S001")  # 37.5 h / 7 days = 5.36 h per calendar day
+    pool = [
+        make_item("T00001-desk", hours=10.0, due=day(3)),
+        make_item("T00002-desk", hours=6.0, due=day(5)),
+        make_item("T00003-desk", hours=4.0, due=day(5)),  # same due date: ties count
+    ]
+    per_day = 37.5 / 7
+    waits = opt.queue_wait_days(pool, [salaried], WINDOW)
+    assert waits["R00001"] == pytest.approx(0.0)
+    assert waits["R00002"] == pytest.approx((10 + 4) / per_day)
+    assert waits["R00003"] == pytest.approx((10 + 6) / per_day)
+    # Frozen work is ahead of everything; a second skill halves the capacity.
+    busy = make_state("S001", ("MID-North", "FWD-North"), frozen=5.0)
+    waits = opt.queue_wait_days(pool[:1], [busy], WINDOW)
+    assert waits["R00001"] == pytest.approx(2.5 / (per_day / 2))
+
+
+def test_queue_wait_days_ignores_freelancers_unless_no_salaried_scout_has_the_skill() -> None:
+    pool = [make_item("T00001-desk", due=day(3)), make_item("T00002-desk", due=day(5))]
+    freelancer = make_state("S002", freelance=True, weekday_hours=7.5)
+    with_salaried = opt.queue_wait_days(pool, [make_state("S001"), freelancer], WINDOW)
+    assert with_salaried["R00002"] == pytest.approx(4.0 / (37.5 / 7))  # salaried capacity only
+    alone = opt.queue_wait_days(pool, [freelancer], WINDOW)
+    assert alone["R00002"] == pytest.approx(4.0 / (37.5 / 7))  # falls back to all scouts
+    assert opt.queue_wait_days(pool, [], WINDOW) == {}
+
+
+def test_load_aware_urgency_raises_the_stake_behind_a_long_queue() -> None:
+    item = make_item("T00001-desk", hours=6.0, due=day(12))  # own slack 12
+    plain = opt.lateness_penalties([item], D0, day(1), 1000.0, 1.0)
+    queued = opt.lateness_penalties([item], D0, day(1), 1000.0, 1.0, {"R00001": 10.0})
+    assert plain["T00001-desk"] == pytest.approx(1000 / 13)
+    assert queued["T00001-desk"] == pytest.approx(1000 / 3)  # slack 12 - 10 = 2
+
+
+def test_load_aware_optimiser_calls_in_a_freelancer_when_the_salaried_queue_is_long() -> None:
+    """The only salaried scout is booked (33 h frozen); a relaxed item could wait for them.
+
+    Plain urgency (slack 14, ~67 at stake) is below the freelancer's premium
+    (6 h x 12.3 = ~74): wait. Counting the ~6.2 days of salaried work ahead,
+    the stake (~113) beats the premium: the idle freelancer takes it now.
+    """
+    pool = [make_item("T00001-desk", hours=6.0, due=day(14))]
+    scouts = [make_state("S001", frozen=33.0), make_state("S002", freelance=True)]
+    plain = CFG.model_copy(update={"cost_basis": "premium"})
+    assert run("optimiser", pool, scouts, plain) == {}
+    aware = plain.model_copy(update={"load_aware": True})
+    assert run("optimiser", pool, scouts, aware) == {"T00001-desk": "S002"}
 
 
 def test_perishable_live_view_is_taken_even_with_lots_of_slack() -> None:
@@ -684,7 +799,7 @@ def test_greedy_policies_draw_no_random_numbers(name: str) -> None:
 def test_optimiser_respects_its_time_limit() -> None:
     """Checked on the deterministic clock; wall time only against the generous backstop."""
     pool, scouts = random_instance(400, 60, seed=3)
-    cfg = CFG.model_copy(update={"time_limit_s": 0.1})  # the smallest allowed
+    cfg = DEFAULTS.model_copy(update={"time_limit_s": 0.1})  # the smallest allowed
     report = opt.solve_assignment(pool, scouts, WINDOW, cfg, np.random.default_rng(0), cost=COST)
     assert report.status in ("OPTIMAL", "FEASIBLE") and not report.fell_back_to_edf
     assert not report.hit_wall_clock
@@ -704,7 +819,7 @@ def test_wall_clock_backstop_is_far_above_the_limit() -> None:
 def test_benchmark_400_items_60_scouts() -> None:
     """Default limit (1 s): model build + solve, with room for a loaded machine."""
     pool, scouts = random_instance(400, 60, seed=1)
-    cfg = CFG.model_copy(update={"time_limit_s": 1.0})
+    cfg = DEFAULTS.model_copy(update={"time_limit_s": 1.0})
     started = time.perf_counter()
     report = opt.solve_assignment(pool, scouts, WINDOW, cfg, np.random.default_rng(0), cost=COST)
     elapsed = time.perf_counter() - started
@@ -734,7 +849,7 @@ def test_optimiser_falls_back_to_edf_when_the_solver_finds_nothing(
 def test_an_infeasible_model_is_a_bug_and_raises(monkeypatch: pytest.MonkeyPatch) -> None:
     """Assigning nothing is always feasible, so INFEASIBLE can only mean a broken model."""
     monkeypatch.setattr(opt, "free_by_day", lambda state, window: [-1] * window.n_days)
-    monkeypatch.setattr(opt, "deadline_index", lambda item, free, window: 0)
+    monkeypatch.setattr(opt, "deadline_index", lambda item, free, window, **kw: 0)
     pool, scouts = tight_deadline_case()
     with pytest.raises(RuntimeError, match="INFEASIBLE"):
         opt.solve_assignment(pool, scouts, WINDOW, CFG, np.random.default_rng(0), cost=COST)

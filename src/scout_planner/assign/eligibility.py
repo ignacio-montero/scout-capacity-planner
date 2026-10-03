@@ -179,14 +179,25 @@ def free_by_day(state: ScoutState, window: AssignmentWindow) -> list[int]:
     return out
 
 
-def deadline_index(item: WorkItem, free: Sequence[int], window: AssignmentWindow) -> int | None:
+def deadline_index(
+    item: WorkItem,
+    free: Sequence[int],
+    window: AssignmentWindow,
+    *,
+    commit_by: int | None = None,
+) -> int | None:
     """Window-day index the item must be done by, for this scout; ``None`` if it never fits.
 
     The due date (or fixture date) clamped into the window, moved later to the
     first day the scout could finish the item alone if it cannot be on time.
+    ``commit_by`` (optimiser, see ``optimiser.commit_index``) pulls the
+    deadline of non-live work forward to that day index: only work the scout
+    can finish by then is committed now (a live view keeps its fixture date).
     """
     key = item.fixed_date or item.due_date
     index = min(max((key - window.start).days, 0), window.n_days - 1)
+    if commit_by is not None and item.fixed_date is None:
+        index = min(index, commit_by)
     need = scaled_hours(item.hours)
     for j in range(index, window.n_days):
         if free[j] >= need:
