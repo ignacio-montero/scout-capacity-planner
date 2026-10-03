@@ -3,12 +3,14 @@
 The *imperative shell* around the pure stages: it parses arguments, loads the
 parameter file, calls the stage, writes files and prints a short summary.
 No modelling logic lives here. Stage commands: ``data`` [1], ``forecast`` [2],
-``plan`` [3]; ``forecast`` and ``plan`` read the run folder that ``data``
-wrote (its ``params.yaml`` and ``raw/``). Later milestones add ``run`` and
-``sweep`` in the same shape.
+``plan`` [3], ``simulate`` [5]; each later stage reads the run folder the
+earlier ones wrote (its ``params.yaml``, ``raw/`` and plan files). ``run``
+creates a run folder in the run store and executes it synchronously;
+``sweep`` expands a sweep file into runs (executed here, or only queued for
+the background worker with ``--queue``).
 
-Exit codes: 0 success, 2 invalid parameters, missing inputs or usage
-(argparse's convention).
+Exit codes: 0 success, 1 a run failed, 2 invalid parameters, missing inputs or
+usage (argparse's convention), 3 a background worker holds the runs folder.
 """
 
 from __future__ import annotations
@@ -21,7 +23,7 @@ from pathlib import Path
 
 from pydantic import ValidationError
 
-from scout_planner import forecast, generate, plan
+from scout_planner import forecast, generate, pipeline, plan, runs, sweep, worker
 from scout_planner.config import DEFAULT_CONFIG_PATH, Params, dump_params, load_params
 
 DEFAULT_OUT = Path("data/runs/dev")
@@ -201,6 +203,213 @@ def cmd_plan(args: argparse.Namespace) -> int:
     return 0
 
 
+# --- [5] simulate, run, sweep ------------------------------------------------------
+
+
+class _Echo:
+    """Prints pipeline progress to the terminal: every stage change, then every ~10%."""
+
+    def __init__(self, step: float = 0.1) -> None:
+        self.step = step
+        self.next = 0.0
+        self.stage: str | None = None
+
+    def __call__(self, fraction: float, stage: str, message: str) -> None:
+        if stage != self.stage or fraction >= self.next or fraction >= 1.0:
+            print(f"  [{fraction:4.0%}] {stage}: {message}", flush=True)
+            self.stage = stage
+            self.next = (int(fraction / self.step) + 1) * self.step
+
+
+def _fmt_range(stat: dict, fmt: str) -> str:
+    if stat["mean"] is None:
+        return "n/a"
+    text = format(stat["mean"], fmt)
+    if stat["min"] != stat["max"]:
+        text += f" [{format(stat['min'], fmt)} .. {format(stat['max'], fmt)}]"
+    return text
+
+
+def print_summary(summary: dict, params: Params) -> None:
+    """Headline metrics of a run (mean [min .. max] over seeds)."""
+    target = params.sim.target_on_time
+    verdict = "meets" if summary["meets_target"] else "MISSES"
+    print(
+        f"on time        {_fmt_range(summary['on_time_rate'], '.1%')} "
+        f"-> {verdict} the {target:.0%} target"
+    )
+    print(
+        f"requests       {_fmt_range(summary['n_requests'], ',.0f')} scored, "
+        f"{_fmt_range(summary['n_late'], ',.0f')} late, "
+        f"{_fmt_range(summary['n_at_risk_day_one'], ',.0f')} at risk from day one, "
+        f"{_fmt_range(summary['n_censored'], ',.0f')} censored (due after the horizon)"
+    )
+    print(
+        f"turnaround     mean {_fmt_range(summary['mean_turnaround_days'], '.1f')} d, "
+        f"P90 {_fmt_range(summary['p90_turnaround_days'], '.1f')} d"
+    )
+    print(
+        f"utilisation    full-time {_fmt_range(summary['util_full_time'], '.0%')}, "
+        f"freelance {_fmt_range(summary['util_freelance'], '.0%')}"
+    )
+    print(
+        "cost           total "
+        + _fmt_range(summary["cost_total"], ",.0f")
+        + " = salaried "
+        + _fmt_range(summary["cost_salaried"], ",.0f")
+        + " + freelance "
+        + _fmt_range(summary["cost_freelance"], ",.0f")
+        + " + automation "
+        + _fmt_range(summary["cost_automation"], ",.0f")
+        + " + late penalty "
+        + _fmt_range(summary["cost_late_penalty"], ",.0f")
+    )
+    print(
+        f"hires          {_fmt_range(summary['n_hires_full_time'], '.0f')} full-time, "
+        f"{_fmt_range(summary['n_hires_freelance'], '.0f')} freelance joined"
+    )
+    d = summary["diagnostics"]
+    print(
+        f"assignment     {d['assignment_runs']} runs, {d['optimiser_solves']} optimiser solves "
+        f"(mean {d['mean_solve_seconds']:.2f} s, max {d['max_solve_seconds']:.2f} s), "
+        f"{d['wall_clock_hits']} wall-clock stops, {d['fallbacks']} EDF fallbacks, "
+        f"{d['live_view_retargets']} live views re-targeted"
+    )
+
+
+def cmd_simulate(args: argparse.Namespace) -> int:
+    """[5] simulate on an existing run folder (raw/ + plans) -> results/ + summary.json."""
+    run = Path(args.run)
+    params = _load_run(run, "raw", "forecast.parquet", "hiring_plan.parquet")
+    if params is None:
+        return 2
+    started = time.perf_counter()
+    print(f"simulating {params.sim.seeds} seed(s), policy {params.assignment.policy}")
+    summary = pipeline.simulate_stage(params, run, _Echo(), lambda: False, max_workers=args.workers)
+    print(
+        f"wrote {run / pipeline.RESULTS_DIR} and {pipeline.SUMMARY_FILE} "
+        f"in {time.perf_counter() - started:.1f} s\n"
+    )
+    print_summary(summary, params)
+    return 0
+
+
+def _report(run_id: str, root: Path, state: str, elapsed: float) -> None:
+    print(f"run {run_id}: {state} in {elapsed:.1f} s")
+    if state == "done":
+        print_summary(
+            pipeline.read_summary(runs.run_dir(run_id, root)), runs.read_params(run_id, root)
+        )
+    elif state == "failed":
+        print(f"  error: {runs.read_status(run_id, root).error} (see log.txt)", file=sys.stderr)
+
+
+def _execute(lease: worker.Lease, run_id: str, root: Path, workers: int | None) -> str:
+    """Execute a queued run here, under the runs lock held by ``lease``."""
+    started = time.perf_counter()
+    lease.current_run = run_id  # heartbeat names the run before it is marked running
+    try:
+        state = pipeline.execute_run_inline(run_id, root, echo=_Echo(), max_workers=workers)
+    finally:
+        lease.current_run = None
+    _report(run_id, root, state, time.perf_counter() - started)
+    return state
+
+
+def _create_and_execute(
+    items: list[tuple[Params, str]], root: Path, sweep_id: str | None, workers: int | None
+) -> tuple[list[str], int] | None:
+    """Create runs and execute them in this process; ``(run_ids, failures)``, or None.
+
+    The CLI becomes the runs folder's executor (``worker.executor_lease``:
+    the single-executor lock, crash recovery, a heartbeat), so a background
+    worker can neither pick these runs up halfway nor mistake them for crashed
+    ones. The runs are created inside the lease for the same reason. If the
+    app's worker already holds the lock, nothing is created and None is returned.
+    """
+    try:
+        with worker.executor_lease(root) as lease:
+            run_ids = [runs.create_run(p, name, sweep_id, root=root) for p, name in items]
+            failures = 0
+            for i, run_id in enumerate(run_ids, 1):
+                if len(run_ids) > 1:
+                    print(f"\n[{i}/{len(run_ids)}] {run_id}")
+                failures += _execute(lease, run_id, root, workers) not in ("done", "skipped")
+            return run_ids, failures
+    except worker.WorkerAlreadyRunning:
+        print(
+            "error: a background worker is running on this runs folder; "
+            "use --queue (sweep) or stop `make app` first",
+            file=sys.stderr,
+        )
+        return None
+
+
+def cmd_run(args: argparse.Namespace) -> int:
+    """Create a run from a parameter file and execute it now."""
+    params = _load(args.params)
+    if params is None:
+        return 2
+    name = args.name or Path(args.params).stem
+    print(f"run {name!r}: executing in {args.root}")
+    outcome = _create_and_execute([(params, name)], args.root, None, args.workers)
+    if outcome is None:
+        return 3
+    return 0 if outcome[1] == 0 else 1
+
+
+def cmd_sweep(args: argparse.Namespace) -> int:
+    """Expand a sweep file into runs; execute them here (default) or only queue them."""
+    try:
+        spec = sweep.load_sweep(args.sweep)
+        expanded = sweep.expand(spec)
+    except FileNotFoundError as exc:
+        print(f"error: file not found: {exc.filename}", file=sys.stderr)
+        return 2
+    except (ValueError, TypeError) as exc:
+        print(f"error: invalid sweep {args.sweep}:\n{exc}", file=sys.stderr)
+        return 2
+
+    if args.publish_only:
+        sweep_id = args.sweep_id or sweep.latest_sweep_id(spec.name, args.root)
+        if sweep_id is None:
+            print(f"error: no runs of sweep {spec.name!r} in {args.root}", file=sys.stderr)
+            return 2
+        return _publish(spec, sweep_id, args)
+
+    sweep_id = sweep.new_sweep_id(spec.name)
+    print(f"sweep {spec.name}: {len(expanded)} runs, sweep_id {sweep_id}")
+    for r in expanded:
+        print(f"  {r.name}")
+    if args.queue:
+        sweep.queue_sweep(spec, args.root, sweep_id=sweep_id)
+        print("queued for the background worker (make app, or python -m scout_planner.worker)")
+        return 0
+    started = time.perf_counter()
+    items = [(r.params, r.name) for r in expanded]
+    outcome = _create_and_execute(items, args.root, sweep_id, args.workers)
+    if outcome is None:
+        return 3
+    run_ids, failures = outcome
+    print(
+        f"\nsweep {spec.name}: {len(run_ids) - failures}/{len(run_ids)} runs done "
+        f"in {time.perf_counter() - started:.0f} s"
+    )
+    if args.publish:
+        _publish(spec, sweep_id, args)
+    return 0 if failures == 0 else 1
+
+
+def _publish(spec: sweep.SweepSpec, sweep_id: str, args: argparse.Namespace) -> int:
+    try:
+        path = sweep.publish(spec, sweep_id, args.root, args.published_dir)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    print(f"published {path}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     """The argument parser, separate from :func:`main` so tests can inspect it."""
     parser = argparse.ArgumentParser(
@@ -220,6 +429,36 @@ def build_parser() -> argparse.ArgumentParser:
     pl = sub.add_parser("plan", help="[3] capacity plan + hiring table into RUN/")
     pl.add_argument("--run", type=Path, default=DEFAULT_OUT, help="run folder (after forecast)")
     pl.set_defaults(func=cmd_plan)
+
+    sim = sub.add_parser("simulate", help="[5] simulate RUN (after plan) into RUN/results/")
+    sim.add_argument("--run", type=Path, default=DEFAULT_OUT, help="run folder (after plan)")
+    sim.add_argument("--workers", type=int, default=None, help="max parallel seed processes")
+    sim.set_defaults(func=cmd_simulate)
+
+    run = sub.add_parser("run", help="create a run from PARAMS and execute it now")
+    run.add_argument("--params", type=Path, default=DEFAULT_CONFIG_PATH, help="parameter YAML")
+    run.add_argument("--name", default=None, help="run name (default: the file name)")
+    run.add_argument("--root", type=Path, default=runs.DEFAULT_ROOT, help="runs folder")
+    run.add_argument("--workers", type=int, default=None, help="max parallel seed processes")
+    run.set_defaults(func=cmd_run)
+
+    sw = sub.add_parser("sweep", help="expand a sweep file into runs and execute them")
+    sw.add_argument("--sweep", type=Path, required=True, help="config/sweeps/<name>.yaml")
+    sw.add_argument("--root", type=Path, default=runs.DEFAULT_ROOT, help="runs folder")
+    sw.add_argument("--workers", type=int, default=None, help="max parallel seed processes")
+    mode = sw.add_mutually_exclusive_group()
+    mode.add_argument("--queue", action="store_true", help="only queue the runs for the worker")
+    mode.add_argument(
+        "--publish-only",
+        action="store_true",
+        help="publish an earlier execution of this sweep (latest, or --sweep-id)",
+    )
+    sw.add_argument("--publish", action="store_true", help="write the published summary")
+    sw.add_argument("--sweep-id", default=None, help="with --publish-only: which execution")
+    sw.add_argument(
+        "--published-dir", type=Path, default=sweep.PUBLISHED_DIR, help="where --publish writes"
+    )
+    sw.set_defaults(func=cmd_sweep)
     return parser
 
 

@@ -1010,12 +1010,39 @@ STREAM_NAMES: tuple[str, ...] = _WORLD_STREAMS + tuple(
 )
 
 
-def generate_world(params: Params, *, seed: int | None = None) -> World:
+# Streams that define the *shape* of the world: the team and the fixture
+# calendar. They always come from replication 0. Everything else is luck.
+FIXED_STREAMS: tuple[str, ...] = ("scouts", "skills", "former_clubs", "fixtures")
+
+
+def world_streams(
+    seed: int, names: Sequence[str] = STREAM_NAMES, replication: int = 0
+) -> dict[str, np.random.Generator]:
+    """The named streams of one world: fixed ones from replication 0, the rest from ``replication``.
+
+    A replication (``sim.seeds``) varies *luck*, not *decisions* or the team:
+    the scouts and the fixture calendar are the same in every replication,
+    while arrivals, durations, live-view flags, rework draws, freelancer hours
+    and leave are drawn again from the replication's own streams
+    (``rng.make_streams(seed, names, replication=k)``). Replication 0 is the
+    world written to ``raw/``; it is identical to a world built before
+    replications existed.
+    """
+    fixed = [n for n in names if n in FIXED_STREAMS]
+    luck = [n for n in names if n not in FIXED_STREAMS]
+    return {**make_streams(seed, fixed), **make_streams(seed, luck, replication=replication)}
+
+
+def generate_world(params: Params, *, seed: int | None = None, replication: int = 0) -> World:
     """Build every stage-[1] table from ``params`` (pure; no file access).
 
-    ``seed`` defaults to ``params.sim.seed``; a replication can pass its own.
+    ``seed`` defaults to ``params.sim.seed``. ``replication`` k > 0 keeps the
+    team and fixtures of replication 0 and redraws the luck (see
+    :func:`world_streams`).
     """
-    streams = make_streams(params.sim.seed if seed is None else seed, STREAM_NAMES)
+    streams = world_streams(
+        params.sim.seed if seed is None else seed, STREAM_NAMES, replication=replication
+    )
     scouts = _generate_scouts(params, streams)
     fixtures = _generate_fixtures(params, streams["fixtures"])
     return World(

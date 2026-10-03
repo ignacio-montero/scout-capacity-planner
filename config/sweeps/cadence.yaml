@@ -1,0 +1,10 @@
+# Side experiment (D-010): does assigning daily instead of weekly matter, for
+# each policy, at 4x growth? Feeds one README paragraph, not the headline grid.
+name: cadence
+base: config/default.yaml
+vary:
+  assignment.cadence: [daily, weekly]
+  assignment.policy: [fcfs, edf, optimiser]
+fixed:
+  demand.actual_growth: 4.0
+  sim.seeds: 3

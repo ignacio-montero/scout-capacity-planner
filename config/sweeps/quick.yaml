@@ -1,0 +1,9 @@
+# Small sweep run by `make all` (a few minutes): is the optimiser worth it, at
+# flat demand and at the 4x growth of the headline question?
+name: quick
+base: config/default.yaml
+vary:
+  assignment.policy: [edf, optimiser]
+  demand.actual_growth: [1.0, 4.0]
+fixed:
+  sim.seeds: 2

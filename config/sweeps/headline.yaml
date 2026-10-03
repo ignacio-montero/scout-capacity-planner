@@ -1,0 +1,12 @@
+# The README answer (first cut; contents still open, NEXT_STEPS Q6): which mix
+# of assignment policy, hiring and automation keeps >= 95% on time at the
+# lowest cost as demand grows? 3 x 3 x 2 x 2 = 36 runs x 5 seeds.
+name: headline
+base: config/default.yaml
+vary:
+  assignment.policy: [fcfs, edf, optimiser]
+  demand.actual_growth: [1.0, 2.0, 4.0]
+  automation.enabled: [false, true]
+  team.follow_hiring_plan: [false, true]
+fixed:
+  sim.seeds: 5

@@ -5,6 +5,7 @@
 DEV_RUN := data/runs/dev
 PARAMS ?= config/default.yaml
 SWEEP ?= quick
+SWEEP_ARGS ?=
 
 .PHONY: setup test lint format \
         data forecast plan simulate run sweep app charts all
@@ -40,16 +41,16 @@ forecast:  ## [2] demand forecast + backtest -> $(DEV_RUN)/{forecast,backtest}.p
 plan:  ## [3] capacity plan + hiring table -> $(DEV_RUN)/{capacity_plan,hiring_plan}.parquet
 	uv run python -m scout_planner.cli plan --run $(DEV_RUN)
 
-simulate:
-	$(call todo,M4)
+simulate:  ## [5] simulate the dev run -> $(DEV_RUN)/results/*.parquet + summary.json
+	uv run python -m scout_planner.cli simulate --run $(DEV_RUN)
 
 ## --- runs, sweeps, app, charts -------------------------------------------------
 
-run:
-	$(call todo,M4)
+run:  ## create a run from PARAMS in data/runs/ and execute it now (NAME=... optional)
+	uv run python -m scout_planner.cli run --params $(PARAMS) $(if $(NAME),--name "$(NAME)",)
 
-sweep:
-	$(call todo,M4)
+sweep:  ## expand config/sweeps/$(SWEEP).yaml into runs and execute them (SWEEP=quick)
+	uv run python -m scout_planner.cli sweep --sweep config/sweeps/$(SWEEP).yaml $(SWEEP_ARGS)
 
 app:  ## start the simulator app and its background worker (Ctrl-C stops both)
 	uv run python -m scout_planner.serve
@@ -57,5 +58,6 @@ app:  ## start the simulator app and its background worker (Ctrl-C stops both)
 charts:
 	$(call todo,M6)
 
-all:
-	$(call todo,M6)
+all: test lint  ## tests + lint, the dev pipeline end to end, then the quick sweep
+	$(MAKE) data forecast plan simulate PARAMS=$(PARAMS)
+	$(MAKE) sweep SWEEP=quick
