@@ -70,13 +70,28 @@ def test_automation_factor_edge_cases(
     assert f.automation_factor(p) == pytest.approx(factor)
 
 
-def test_forecast_hours_are_requests_times_hours_per_request(
-    built: tuple[pd.DataFrame, pd.DataFrame],
-) -> None:
+def test_hours_per_request_variance_by_hand() -> None:
+    # desk U(4,10): (10-4)^2/12 = 3; live 8 h with p 0.4: 0.4*0.6*64 = 15.36;
+    # write-up U(2,4): 4/12.
+    assert f.hours_per_request_variance(P) == pytest.approx(3 + 15.36 + 4 / 12)
+
+
+def test_hours_per_request_variance_with_automation_by_hand() -> None:
+    p = apply_overrides(P, {"automation.enabled": True})
+    # desk X = 0.6 D (p 0.85) or D + 1 (p 0.15), D ~ U(4,10): E[D] 7, E[D^2] 52.
+    e1 = 0.85 * 0.6 * 7 + 0.15 * 8
+    e2 = 0.85 * 0.36 * 52 + 0.15 * (52 + 2 * 7 + 1)
+    assert f.hours_per_request_variance(p) == pytest.approx(e2 - e1**2 + 15.36 + 4 / 12)
+
+
+def test_forecast_hours_mean_and_spread(built: tuple[pd.DataFrame, pd.DataFrame]) -> None:
     fc, _ = built
     hpr = f.hours_per_request(P)
     np.testing.assert_allclose(fc["hours_p50"], fc["requests_p50"] * hpr)
-    np.testing.assert_allclose(fc["hours_pq"], fc["requests_pq"] * hpr)
+    # Var(H) = n Var(h) + E[h]^2 Var(n) > E[h]^2 Var(n): hours are relatively wider.
+    req_spread = fc["requests_pq"] - fc["requests_p50"]
+    hours_spread = fc["hours_pq"] - fc["hours_p50"]
+    assert (hours_spread > req_spread * hpr).all()
 
 
 def test_automation_lowers_hours_but_not_requests(world: g.World) -> None:
@@ -119,6 +134,27 @@ def test_top_down_split_uses_trailing_twelve_month_shares(
         pd.testing.assert_series_equal(
             shares.sort_index(), expected.sort_index(), check_names=False, rtol=1e-9
         )
+
+
+def test_small_skills_get_relatively_wider_quantiles(
+    built: tuple[pd.DataFrame, pd.DataFrame],
+) -> None:
+    """Per-skill Poisson noise: a skill with fewer requests is relatively noisier."""
+    fc, _ = built
+    jan = fc[fc["month"] == fc["month"].min()].sort_values("requests_p50")
+    relative = (jan["requests_pq"] / jan["requests_p50"]).to_numpy()
+    assert relative[0] > relative[-1] * 1.05
+    assert (np.diff(relative) <= 1e-9).all()  # monotone in size
+
+
+def test_season_index_is_a_multiplicative_profile(
+    built: tuple[pd.DataFrame, pd.DataFrame],
+) -> None:
+    fc, _ = built
+    season = fc.groupby("month", sort=True)["season_index"].first().to_numpy()
+    assert np.exp(np.log(season).mean()) == pytest.approx(1.0)
+    # Transfer windows (January, June-August) above 1; October-December below.
+    assert season[0] > 1.15 and season[6] > 1.1 and (season[9:] < 0.95).all()
 
 
 # --- leakage and the growth overlay ------------------------------------------------------
@@ -186,7 +222,7 @@ def test_growth_ramp_matches_the_generator() -> None:
 
 
 def test_ets_base_plus_damped_trend_reproduces_the_ets_mean(world: g.World) -> None:
-    """``base`` (level + season at the origin) is ETS's forecast minus its trend part."""
+    """``log_base`` (level + season at the origin) is ETS's log forecast minus its trend part."""
     counts = f.monthly_counts(
         world.requests[world.requests["period"] == "history"], f.history_months(P)
     )
@@ -195,21 +231,34 @@ def test_ets_base_plus_damped_trend_reproduces_the_ets_mean(world: g.World) -> N
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         res = ETSModel(
-            f._series(y), error="add", trend="add", damped_trend=True,
+            f._series(np.log(y)), error="add", trend="add", damped_trend=True,
             seasonal="add", seasonal_periods=12,
         ).fit(disp=False)  # fmt: skip
     phi = float(np.asarray(res.params)[res.param_names.index("damping_trend")])
     trend = np.cumsum(phi ** np.arange(1, 13)) * float(np.asarray(res.slope)[-1])
-    np.testing.assert_allclose(fit.base + trend, fit.mean, atol=1e-6)
-    assert (np.diff(fit.sd) >= -1e-9).all()  # uncertainty does not shrink with horizon
+    mu = np.asarray(res.forecast(12))
+    np.testing.assert_allclose(fit.log_base + trend, mu, atol=1e-6)
+    np.testing.assert_allclose(fit.mean, np.exp(mu + fit.log_sd**2 / 2), rtol=1e-6)
+    assert (np.diff(fit.log_sd) >= -1e-9).all()  # uncertainty does not shrink with horizon
+
+
+def test_log_model_fits_multiplicative_seasonality_exactly() -> None:
+    """A noiseless series = level x season x growth: the log model recovers the peaks."""
+    season = np.array(g.SEASONALITY_PROFILE)
+    y = 200 * np.resize(season, 48) * 1.01 ** np.arange(48)
+    fit = f.fit_ets(y, 12)
+    expected = 200 * season * 1.01 ** np.arange(48, 60)
+    np.testing.assert_allclose(fit.mean, expected, rtol=0.02)
+    np.testing.assert_allclose(fit.season / fit.season.mean(), season / season.mean(), rtol=0.02)
 
 
 def test_seasonal_naive_repeats_last_year() -> None:
-    y = np.arange(30, dtype=float)
+    y = 100 * 1.1 ** np.arange(30)  # every year-on-year log difference is 12 log(1.1)
     fit = f.seasonal_naive(y, 14)
-    np.testing.assert_array_equal(fit.mean, np.r_[y[-12:], y[-12:-10]])
-    assert fit.sd[0] == pytest.approx(12.0)  # every year-on-year difference is 12
-    assert fit.sd[12] == pytest.approx(12.0 * np.sqrt(2))
+    np.testing.assert_allclose(fit.mean, np.r_[y[-12:], y[-12:-10]])
+    np.testing.assert_allclose(np.exp(fit.log_base), fit.mean)
+    assert fit.log_sd[0] == pytest.approx(0.0, abs=1e-9)  # no spread around the trend
+    assert fit.method == f.METHOD_NAIVE
 
 
 def test_ets_refuses_too_short_series_and_fallback_catches_it(
@@ -236,13 +285,14 @@ def test_fallback_path_flags_and_scales_last_year(
     assert set(fc["method"]) == {f.METHOD_NAIVE} and set(bt["method"]) == {f.METHOD_NAIVE}
     np.testing.assert_array_equal(bt["model"][bt["skill_type"] == f.ALL],
                                   bt["naive"][bt["skill_type"] == f.ALL])  # fmt: skip
-    # Plan year = last year's month x (ramp this month / ramp a year earlier).
+    # Plan year = last year's month x (ramp this month / ramp a year earlier),
+    # times a small lognormal correction for the level uncertainty.
     hist = world.requests[world.requests["period"] == "history"]
     last_year = f.monthly_counts(hist, f.history_months(P)).sum(axis=1).to_numpy()[-12:]
     months = f.plan_months(P)
     year_before = [g.add_months(m, -12) for m in months]
     ramp = f.monthly_growth_ramp(P, months, 4.0) / f.monthly_growth_ramp(P, year_before, 4.0)
-    np.testing.assert_allclose(monthly_total(fc).to_numpy(), last_year * ramp)
+    np.testing.assert_allclose(monthly_total(fc).to_numpy(), last_year * ramp, rtol=0.02)
     assert (monthly_total(fc, "requests_pq") > monthly_total(fc)).all()
 
 
@@ -327,6 +377,55 @@ def test_shorter_history_gives_one_origin() -> None:
     p = apply_overrides(P, {"demand.history_months": 36})
     _, bt = f.build_forecast(g.generate_world(p), p)
     assert bt["origin"].nunique() == 1
+
+
+# --- calibration of the planning quantile (several seeds) ------------------------------------
+
+
+@pytest.mark.slow
+def test_planning_quantile_coverage_over_seeds() -> None:
+    """At q = 0.8 the realised demand should fall below the quantile ~80% of the time.
+
+    10 seeds x 12 months x 15 skills (requests and hours) and 10 x 12 aggregate
+    months, assumed growth = actual. Measured: ~0.77 per skill, ~0.68-0.72
+    aggregate (the plan-year mean runs ~1.5% low). Before the per-skill
+    variance terms: 0.55.
+    """
+    skill_hits, hour_hits, agg_hits = [], [], []
+    for seed in range(1, 11):
+        p = apply_overrides(P, {"sim.seed": seed})
+        w = g.generate_world(p)
+        fc, _ = f.build_forecast(w, p)
+        fut = w.requests[w.requests["period"] == "future"]
+        months = f.plan_months(p)
+        real = f.monthly_counts(fut, months)
+        pq = fc.pivot(index="month", columns="skill_type", values="requests_pq")
+        skill_hits.append(real.to_numpy() <= pq.reindex(index=months, columns=real.columns))
+        work = fut.assign(
+            h=fut["desk_hours"] + fut["writeup_hours"] + fut["needs_live_view"] * 8.0,
+            month=[d.replace(day=1) for d in fut["received_date"]],
+        )
+        real_h = work.pivot_table(index="month", columns="skill_type", values="h", aggfunc="sum")
+        hq = fc.pivot(index="month", columns="skill_type", values="hours_pq")
+        hq = hq.reindex(index=months, columns=real.columns)
+        hour_hits.append(real_h.reindex(index=months, columns=real.columns).fillna(0) <= hq)
+        hist = w.requests[w.requests["period"] == "history"]
+        agg = f.plan_year_aggregate(f.monthly_counts(hist, f.history_months(p)), p)
+        agg_hits.append(real.sum(axis=1).to_numpy() <= agg.quantile(0.8))
+    assert 0.7 <= np.mean(skill_hits) <= 0.9
+    assert 0.7 <= np.mean(hour_hits) <= 0.9
+    assert 0.6 <= np.mean(agg_hits) <= 0.95
+
+
+def test_aggregate_quantile_combines_poisson_and_level_variance(world: g.World) -> None:
+    hist = world.requests[world.requests["period"] == "history"]
+    agg = f.plan_year_aggregate(f.monthly_counts(hist, f.history_months(P)), P)
+    np.testing.assert_allclose(agg.var_poisson, agg.mean)
+    assert (agg.var_level >= 0).all()
+    z = 0.8416212335729143
+    np.testing.assert_allclose(
+        agg.quantile(0.8), agg.mean + z * np.sqrt(agg.mean + agg.var_level), rtol=1e-9
+    )
 
 
 # --- determinism, I/O, runtime ----------------------------------------------------------------

@@ -13,11 +13,15 @@ How the forecast is built
 * **Top-down (D-005).** One model for the aggregate monthly request count;
   each skill gets ``aggregate x its share of the trailing 12 months``. Skill
   series are small, noisy counts; the aggregate is smooth.
-* **Statistical model.** ETS(A,Ad,A) from ``statsmodels``: additive error,
-  damped additive trend, additive yearly seasonality. All-additive is the
-  family with *exact* (closed-form) prediction intervals, so no simulation
-  and no extra randomness. A multiplicative-season variant was tried; it was
-  not consistently better across seeds and needs simulated intervals.
+* **Statistical model.** ETS(A,Ad,A) from ``statsmodels`` fitted on the
+  **log** of the monthly counts: additive error, damped additive trend,
+  additive yearly seasonality *in logs*, i.e. multiplicative in counts.
+  Demand is multiplicative (season x trend), so additive seasonality on raw
+  counts under-forecast the January peak by ~13% and broke down when the
+  history's level changed a lot (D-021). All-additive models have *exact*
+  prediction intervals, so there is no simulation and no extra randomness;
+  in logs they become lognormal. Point forecasts are expected values
+  ``exp(mu + sd^2 / 2)``, not the median ``exp(mu)``.
 * **Plan year = statistical base x assumed growth (D-020).** For the plan year
   the model's damped trend is *replaced* by the business assumption: the
   forecast for plan month ``m`` is the ETS level plus the seasonal term at the
@@ -27,16 +31,28 @@ How the forecast is built
   ``assumed_growth ** t`` after it), with ``capacity_plan.assumed_growth``.
   Multiplying the full ETS forecast (trend included) by the ramp would count
   the history's organic growth twice.
-* **Uncertainty.** ETS prediction intervals give a standard deviation per
-  horizon. Its size *relative to* the ETS mean is applied to the overlaid
-  mean: ``q = mean x (1 + z_q x sd_h / ets_mean_h)``. P50 is the mean (the
-  error is symmetric). Per-skill quantiles are the aggregate quantiles times
-  the share, i.e. skills are treated as perfectly correlated (a
-  simplification: it understates the relative noise of small skills).
+* **Uncertainty, built from its sources** (``plan_year_forecast``):
+  - *level*: the model's log forecast variance minus the Poisson noise it saw
+    at the origin's level (``1 / count`` in logs), as a lognormal factor on
+    the overlaid mean;
+  - *arrivals*: Poisson, variance = expected count, per skill (a skill with
+    10 requests a month is relatively far noisier than the total);
+  - *share*: the trailing-12-month skill share is an estimate (multinomial
+    variance ``p (1 - p) / N``);
+  - *hours*: ``Var(H) = n Var(h) + E[h]^2 Var(n)``, with ``Var(h)`` from the
+    task-duration ranges, the live-view share and automation.
+  Quantiles use the normal approximation. Over 10 seeds at q = 0.8 the
+  realised per-skill monthly demand is below ``requests_pq`` in ~0.77 of
+  skill-months (0.55 before these terms were added); the aggregate quantile
+  (``AggregatePlanYear.quantile``) covers ~0.7. The plan-year mean is about
+  1.5% low on average (the ETS level lags a growing level slightly).
 * **Fallback.** If the ETS fit fails (exception, non-finite output, too little
   data), the seasonal naive forecast is used instead (same month last year,
   scaled by the growth ramp), its interval from the spread of year-on-year
-  differences. It is logged and flagged in the ``method`` column.
+  log differences. It is logged and flagged in the ``method`` column.
+* **Seasonal index.** Each row carries the model's multiplicative seasonal
+  factor for its month (``season_index``, geometric mean 1), so the capacity
+  plan can tell a seasonal peak from a lasting shortfall.
 * **Hours.** ``hours = requests x hours_per_request(params)``, where hours per
   request uses the run's demand shape and automation settings.
 
@@ -44,7 +60,7 @@ The backtest
 ------------
 *Rolling origin* evaluation on the history only: at origins every 3 months
 with at least 24 months of training data and a full 12-month horizon inside
-the history, fit the full ETS (trend included) on the data before the origin,
+the history, fit the full log-ETS (trend included) on the data before the origin,
 forecast 12 months, and compare with what happened. The baseline is the
 *seasonal naive* forecast (same month last year). Skill rows use the
 top-down model vs each skill's own seasonal naive. WAPE (weighted absolute
@@ -76,6 +92,7 @@ logger = logging.getLogger(__name__)
 SEASON_LENGTH = 12  # months in a seasonal cycle
 SHARE_WINDOW_MONTHS = 12  # trailing window for the top-down skill shares
 MIN_ETS_MONTHS = 2 * SEASON_LENGTH  # below this, seasonal ETS is not attempted
+LOG_FLOOR = 0.5  # counts are floored here before taking logs (an empty month)
 BACKTEST_MIN_TRAIN_MONTHS = 24
 BACKTEST_HORIZON = 12
 BACKTEST_STEP_MONTHS = 3
@@ -84,7 +101,9 @@ METHOD_ETS = "ets"
 METHOD_NAIVE = "seasonal_naive"
 
 # --- table schemas (the contract, as code) -----------------------------------------
-# ``method`` extends DATA_CONTRACTS section 2: it flags rows produced by the fallback.
+# Extensions of DATA_CONTRACTS section 2: ``method`` flags rows produced by the
+# fallback; ``season_index`` is the model's seasonal factor for the month
+# (geometric mean 1), which the capacity plan uses to tell peaks from trends.
 
 FORECAST_SCHEMAS: dict[str, pa.Schema] = {
     "forecast": pa.schema(
@@ -95,6 +114,7 @@ FORECAST_SCHEMAS: dict[str, pa.Schema] = {
             ("requests_pq", pa.float64()),
             ("hours_p50", pa.float64()),
             ("hours_pq", pa.float64()),
+            ("season_index", pa.float64()),
             ("method", pa.string()),
         ]
     ),
@@ -144,6 +164,32 @@ def hours_per_request(params: Params) -> float:
     )
 
 
+def _uniform_moments(low: float, high: float) -> tuple[float, float]:
+    """``(E[X], E[X^2])`` of a uniform on ``[low, high]``."""
+    return (low + high) / 2, (low * low + low * high + high * high) / 3
+
+
+def hours_per_request_variance(params: Params) -> float:
+    """Variance of one request's hours: desk (with automation) + live view + write-up.
+
+    The three parts are independent. Desk ~ uniform; with automation it is
+    ``D (1 - reduction)`` with probability ``1 - rework``, else ``D + overhead``
+    (a two-point mixture). Live view = ``live_view_hours`` with probability
+    ``live_view_share`` (Bernoulli). Write-up ~ uniform.
+    """
+    d, a = params.demand, params.automation
+    m1, m2 = _uniform_moments(*d.desk_hours)
+    if a.enabled:
+        r, keep, o = a.rework_rate, 1 - a.desk_reduction, a.rework_overhead_hours
+        e1 = (1 - r) * keep * m1 + r * (m1 + o)
+        e2 = (1 - r) * keep**2 * m2 + r * (m2 + 2 * o * m1 + o * o)
+    else:
+        e1, e2 = m1, m2
+    w1, w2 = _uniform_moments(*d.writeup_hours)
+    share = d.live_view_share
+    return (e2 - e1**2) + share * (1 - share) * d.live_view_hours**2 + (w2 - w1**2)
+
+
 # --- monthly series ------------------------------------------------------------------
 
 
@@ -189,18 +235,22 @@ def skill_shares(counts: pd.DataFrame, window: int = SHARE_WINDOW_MONTHS) -> pd.
 
 @dataclass(frozen=True)
 class ModelForecast:
-    """An aggregate forecast for horizons 1..h made at one origin.
+    """An aggregate forecast for horizons 1..h made at one origin, fitted in log space.
 
-    ``mean``: the model's own forecast (trend included; this is what the
-    backtest scores). ``base``: the same without any further trend, i.e. level
-    and seasonal term at the origin (what the growth ramp multiplies).
-    ``sd``: forecast standard deviation per horizon. ``method``: ``ets`` or
-    ``seasonal_naive``.
+    * ``mean``: expected count, the model's own forecast with its trend (what
+      the backtest scores): ``exp(mu_h + sd_h**2 / 2)``.
+    * ``log_base``: log of the count without any further trend, i.e. level +
+      seasonal term at the origin (what the growth ramp multiplies).
+    * ``log_sd``: forecast standard deviation in log space per horizon.
+    * ``season``: multiplicative seasonal index of each horizon month
+      (geometric mean 1 over a year); the plan uses it to deseasonalise gaps.
+    * ``method``: ``ets`` or ``seasonal_naive``.
     """
 
     mean: np.ndarray
-    base: np.ndarray
-    sd: np.ndarray
+    log_base: np.ndarray
+    log_sd: np.ndarray
+    season: np.ndarray
     method: str
 
 
@@ -210,10 +260,17 @@ def _series(y: np.ndarray) -> pd.Series:
     return pd.Series(y, index=pd.date_range("2000-01-01", periods=len(y), freq="MS"))
 
 
-def fit_ets(y: np.ndarray, horizon: int) -> ModelForecast:
-    """Fit ETS(A,Ad,A) with a yearly season to ``y`` and forecast ``horizon`` months.
+def _log(y: np.ndarray) -> np.ndarray:
+    # Monthly totals are in the hundreds; the floor only guards an empty month.
+    return np.log(np.maximum(np.asarray(y, dtype=float), LOG_FLOOR))
 
-    Raises ``ValueError`` if there is too little data or the result is not finite.
+
+def fit_ets(y: np.ndarray, horizon: int) -> ModelForecast:
+    """Fit ETS(A,Ad,A) with a yearly season to ``log(y)``; forecast ``horizon`` months.
+
+    Additive in logs = multiplicative in counts: seasonal peaks scale with the
+    level, as they do in the data. Raises ``ValueError`` if there is too little
+    data or the result is not finite.
     """
     if len(y) < MIN_ETS_MONTHS:
         raise ValueError(f"ETS needs >= {MIN_ETS_MONTHS} months, got {len(y)}")
@@ -222,7 +279,7 @@ def fit_ets(y: np.ndarray, horizon: int) -> ModelForecast:
         # check below, not printed for every backtest origin.
         warnings.simplefilter("ignore")
         model = ETSModel(
-            _series(np.asarray(y, dtype=float)),
+            _series(_log(y)),
             error="add",
             trend="add",
             damped_trend=True,
@@ -231,29 +288,35 @@ def fit_ets(y: np.ndarray, horizon: int) -> ModelForecast:
         )
         res = model.fit(disp=False)
         pred = res.get_prediction(start=len(y), end=len(y) + horizon - 1)
-    mean = np.asarray(pred.predicted_mean, dtype=float)
-    sd = np.sqrt(np.asarray(pred.forecast_variance, dtype=float))
+    mu = np.asarray(pred.predicted_mean, dtype=float)
+    log_sd = np.sqrt(np.asarray(pred.forecast_variance, dtype=float))
     # Level + seasonal term at the origin; seasonal state for horizon h is the
     # one from the same month a year earlier. Checked against ETS's own mean in
-    # the tests (mean == base + damped trend sum).
+    # the tests (mu == log_base + damped trend sum).
     season = np.asarray(res.season, dtype=float)[-SEASON_LENGTH:]
-    base = float(np.asarray(res.level)[-1]) + np.resize(season, horizon)
-    if not (np.isfinite(mean).all() and np.isfinite(sd).all() and np.isfinite(base).all()):
+    log_base = float(np.asarray(res.level)[-1]) + np.resize(season, horizon)
+    season_index = np.exp(np.resize(season - season.mean(), horizon))
+    mean = np.exp(mu + log_sd**2 / 2)
+    if not all(np.isfinite(a).all() for a in (mean, log_sd, log_base, season_index)):
         raise ValueError("ETS fit produced non-finite values")
-    return ModelForecast(mean=mean, base=base, sd=sd, method=METHOD_ETS)
+    return ModelForecast(mean, log_base, log_sd, season_index, METHOD_ETS)
 
 
 def seasonal_naive(y: np.ndarray, horizon: int) -> ModelForecast:
-    """Same month last year, repeated; sd from the year-on-year differences."""
+    """Same month last year, repeated; log sd from the year-on-year log differences."""
     y = np.asarray(y, dtype=float)
     if len(y) < SEASON_LENGTH:
         raise ValueError(f"seasonal naive needs >= {SEASON_LENGTH} months, got {len(y)}")
-    mean = np.resize(y[-SEASON_LENGTH:], horizon)
-    diffs = y[SEASON_LENGTH:] - y[:-SEASON_LENGTH]
-    sd_value = float(np.sqrt(np.mean(diffs**2))) if len(diffs) else float(np.std(y))
+    last = y[-SEASON_LENGTH:]
+    log_base = np.resize(_log(last), horizon)
+    logs = _log(y)
+    diffs = logs[SEASON_LENGTH:] - logs[:-SEASON_LENGTH]
+    sd_value = float(np.std(diffs)) if len(diffs) > 1 else 0.0
     # Error of a seasonal naive forecast compounds once per completed season.
-    sd = sd_value * np.sqrt(np.arange(horizon) // SEASON_LENGTH + 1)
-    return ModelForecast(mean=mean, base=mean.copy(), sd=sd, method=METHOD_NAIVE)
+    log_sd = sd_value * np.sqrt(np.arange(horizon) // SEASON_LENGTH + 1)
+    log_last = _log(last)
+    season_index = np.exp(np.resize(log_last - log_last.mean(), horizon))
+    return ModelForecast(np.resize(last, horizon), log_base, log_sd, season_index, METHOD_NAIVE)
 
 
 def forecast_with_fallback(y: np.ndarray, horizon: int, *, label: str = "") -> ModelForecast:
@@ -292,51 +355,91 @@ def _history_requests(world_or_requests: World | pd.DataFrame) -> pd.DataFrame:
     return req[req["period"] == "history"]
 
 
-def plan_year_forecast(counts: pd.DataFrame, params: Params) -> pd.DataFrame:
-    """The ``forecast`` table from history counts (months x skills) and the run's params."""
-    months = plan_months(params)
-    horizon = len(months)
-    y = counts.sum(axis=1).to_numpy()
-    fit = forecast_with_fallback(y, horizon, label=" (plan year)")
+@dataclass(frozen=True)
+class AggregatePlanYear:
+    """The plan-year aggregate: expected count and its two variance parts per month.
 
-    cp = params.capacity_plan
-    origin_month = add_months(SIM_START, -1)  # the last history month
-    ramp_origin = monthly_growth_ramp(params, [origin_month], cp.assumed_growth)[0]
+    ``var_poisson`` is the arrival noise of the month itself (= ``mean``);
+    ``var_level`` is the uncertainty about the level and season (the model's
+    forecast variance net of the noise it saw in the history), scaled to the
+    overlaid mean. ``quantile(z)`` gives the aggregate planning quantile.
+    """
+
+    months: list[dt.date]
+    mean: np.ndarray
+    var_level: np.ndarray
+    season: np.ndarray
+    method: str
+
+    @property
+    def var_poisson(self) -> np.ndarray:
+        return self.mean
+
+    def quantile(self, q: float) -> np.ndarray:
+        """Normal approximation of the aggregate ``q`` quantile."""
+        z = NormalDist().inv_cdf(q)
+        return self.mean + z * np.sqrt(self.var_poisson + self.var_level)
+
+
+def plan_year_aggregate(counts: pd.DataFrame, params: Params) -> AggregatePlanYear:
+    """Expected aggregate requests per plan month and their uncertainty (D-020).
+
+    ``log E = log_base + log(ramp)``: the ETS level and season at the origin,
+    with the assumed growth ramp in place of the model's trend. The model's
+    log variance minus the arrival noise it saw at the origin's level
+    (Poisson: ``1 / count`` in log terms) is the level uncertainty; it is
+    carried as a lognormal factor on the overlaid mean.
+    """
+    months = plan_months(params)
+    fit = forecast_with_fallback(counts.sum(axis=1).to_numpy(), len(months), label=" (plan year)")
+    growth = params.capacity_plan.assumed_growth
+    ramp = monthly_growth_ramp(params, months, growth)
     if fit.method == METHOD_ETS:
         # ETS base is the level at the origin: scale it from there.
-        ramp = monthly_growth_ramp(params, months, cp.assumed_growth) / ramp_origin
+        origin_month = add_months(SIM_START, -1)  # the last history month
+        ramp = ramp / monthly_growth_ramp(params, [origin_month], growth)[0]
     else:
         # Naive base is last year's value for that month: scale it from that month.
         year_before = [add_months(m, -SEASON_LENGTH) for m in months]
-        ramp = monthly_growth_ramp(params, months, cp.assumed_growth) / monthly_growth_ramp(
-            params, year_before, cp.assumed_growth
-        )
-    p50 = np.clip(fit.base * ramp, 0.0, None)
-    z = NormalDist().inv_cdf(cp.quantile)
-    scale = np.where(fit.mean > 0, fit.mean, np.maximum(fit.base, 1.0))
-    relative_sd = fit.sd / np.maximum(scale, 1e-9)
-    pq_ = p50 * (1.0 + z * relative_sd)
+        ramp = ramp / monthly_growth_ramp(params, year_before, growth)
+    poisson_log_var = 1.0 / np.maximum(np.exp(fit.log_base), LOG_FLOOR)
+    level_log_var = np.maximum(fit.log_sd**2 - poisson_log_var, 0.0)
+    mean = np.exp(fit.log_base + level_log_var / 2) * ramp
+    var_level = mean**2 * np.expm1(level_log_var)
+    return AggregatePlanYear(months, mean, var_level, fit.season, fit.method)
 
+
+def plan_year_forecast(counts: pd.DataFrame, params: Params) -> pd.DataFrame:
+    """The ``forecast`` table from history counts (months x skills) and the run's params.
+
+    Per skill ``s`` with share ``p`` (estimated from ``N`` requests) and
+    aggregate mean ``E``: ``E_s = p E`` and
+    ``Var(n_s) = p E (own arrivals) + p^2 Var_level + E^2 p (1 - p) / N``
+    (the last term: the share itself is an estimate). Hours add the spread of
+    hours per request: ``Var(H_s) = E_s Var(h) + E[h]^2 Var(n_s)``. Quantiles
+    use the normal approximation; ``*_p50`` is the expected value.
+    """
+    agg = plan_year_aggregate(counts, params)
+    window = counts.iloc[-SHARE_WINDOW_MONTHS:]
     shares = skill_shares(counts)
-    hpr = hours_per_request(params)
-    rows = {
-        "month": [],
-        "skill_type": [],
-        "requests_p50": [],
-        "requests_pq": [],
-        "hours_p50": [],
-        "hours_pq": [],
-        "method": [],
-    }
-    for k, month in enumerate(months):
-        for skill, share in shares.items():
+    n_window = max(float(window.to_numpy().sum()), 1.0)
+    z = NormalDist().inv_cdf(params.capacity_plan.quantile)
+    mean_h, var_h = hours_per_request(params), hours_per_request_variance(params)
+
+    rows: dict[str, list] = {c: [] for c in FORECAST_SCHEMAS["forecast"].names}
+    for k, month in enumerate(agg.months):
+        for skill, p in shares.items():
+            e_s = p * agg.mean[k]
+            var_n = e_s + p**2 * agg.var_level[k] + agg.mean[k] ** 2 * p * (1 - p) / n_window
+            var_hours = e_s * var_h + mean_h**2 * var_n
             rows["month"].append(month)
             rows["skill_type"].append(skill)
-            rows["requests_p50"].append(float(p50[k] * share))
-            rows["requests_pq"].append(float(pq_[k] * share))
-            rows["hours_p50"].append(float(p50[k] * share * hpr))
-            rows["hours_pq"].append(float(pq_[k] * share * hpr))
-            rows["method"].append(fit.method)
+            rows["requests_p50"].append(float(e_s))
+            rows["requests_pq"].append(float(e_s + z * np.sqrt(var_n)))
+            rows["hours_p50"].append(float(e_s * mean_h))
+            rows["hours_pq"].append(float(e_s * mean_h + z * np.sqrt(var_hours)))
+            rows["season_index"].append(float(agg.season[k]))
+            rows["method"].append(agg.method)
     return _frame("forecast", rows)
 
 
