@@ -135,12 +135,9 @@ else:
     )
 monthly = {}
 for letter, run_id in zip(letters, selected_ids, strict=True):
-    outcomes, raw = (
-        ui.run_table(run_id, "outcomes").value,
-        ui.run_table(run_id, "raw_requests").value,
-    )
-    if outcomes is not None and raw is not None:
-        monthly[letter] = monthly_on_time(outcomes, raw)
+    outcomes = ui.run_table(run_id, "outcomes").value
+    if outcomes is not None:
+        monthly[letter] = monthly_on_time(outcomes)
 if len(monthly) == len(letters):
     targets = [p.sim.target_on_time for p in params_list]
     chart(charts.fig_on_time_by_month(monthly, policies, targets, show_range=show_range))

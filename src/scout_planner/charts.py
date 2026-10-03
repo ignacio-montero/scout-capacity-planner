@@ -22,6 +22,7 @@ Conventions (DESIGN_SYSTEM.md sections 2-3):
 from __future__ import annotations
 
 import math
+import textwrap
 from collections.abc import Mapping, Sequence
 from typing import Any
 
@@ -78,6 +79,10 @@ GAP_COLORSCALE: list[list[Any]] = [[0.0, "#0072B2"], [0.5, NEUTRAL_MID], [1.0, "
 FALLBACK_COLOR = NEUTRAL  # a policy name the tokens don't know
 
 TITLE_SIZE = 18
+# Wrap widths in characters: titles stay readable in a ~800 px wide app window,
+# where a one-line 90-character title would be clipped.
+TITLE_WRAP = 58
+SUBTITLE_WRAP = 85
 SUBTITLE_SIZE = 13
 README_SIZE = (1200, 675)
 README_FOOTNOTE = "Synthetic data · fictional scouting agency"
@@ -122,13 +127,17 @@ def style_figure(
     ``for_readme=True`` makes a self-contained white figure at 1200x675 with a
     source footnote (a transparent PNG would put dark text on GitHub's dark mode).
     """
-    text = f"{title}"
-    if subtitle:
-        text += f"<br><span style='font-size:{SUBTITLE_SIZE}px;color:{NEUTRAL}'>{subtitle}</span>"
+    title_lines = wrap_text(title, TITLE_WRAP)
+    sub_lines = wrap_text(subtitle, SUBTITLE_WRAP) if subtitle else []
+    text = "<br>".join(title_lines)
+    span = f"<span style='font-size:{SUBTITLE_SIZE}px;color:{NEUTRAL}'>"
+    for line in sub_lines:
+        text += f"<br>{span}{line}</span>"
+    top = 40 + 24 * len(title_lines) + 18 * len(sub_lines)
     fig.update_layout(
         title={"text": text, "font": {"size": TITLE_SIZE}, "x": 0, "xanchor": "left"},
         legend={"orientation": "h", "y": 1.02, "yanchor": "bottom", "x": 0, "xanchor": "left"},
-        margin={"t": 100 if subtitle else 70, "l": 10, "r": 30, "b": 10},
+        margin={"t": top, "l": 10, "r": 30, "b": 10},
         hovermode="closest",
     )
     if show_legend is not None:
@@ -156,6 +165,11 @@ def style_figure(
             font={"size": 11, "color": NEUTRAL},
         )
     return fig
+
+
+def wrap_text(text: str, width: int) -> list[str]:
+    """Split a title into lines of at most ``width`` characters (plotly needs ``<br>``)."""
+    return textwrap.wrap(text, width=width, break_long_words=False) or [text]
 
 
 def add_target_line(
@@ -252,6 +266,14 @@ def takeaway_backlog(band: pd.DataFrame) -> str | None:
     )
 
 
+def takeaway_on_time_share(on_time: pd.Series) -> str | None:
+    """With two promises (standard and urgent) "within N days" is ambiguous; count
+    deliveries by each request's own promised date instead."""
+    if on_time.empty:
+        return None
+    return f"{fmt_pct(float(on_time.mean()))} of reports arrive by their promised date"
+
+
 def takeaway_on_time_by_month(band: pd.DataFrame, target: float) -> str | None:
     if band.empty:
         return None
@@ -262,10 +284,11 @@ def takeaway_on_time_by_month(band: pd.DataFrame, target: float) -> str | None:
 
 
 def takeaway_turnaround(turnaround: pd.Series, promise_days: float) -> str | None:
-    values = turnaround.dropna()
-    if values.empty:
+    """Share delivered within the promise. Unfinished requests (NaN turnaround) stay
+    in the denominator as "not within", so the figure agrees with the on-time rate."""
+    if turnaround.empty or turnaround.isna().all():
         return None
-    share = float((values <= promise_days).mean())
+    share = float((turnaround <= promise_days).sum() / len(turnaround))
     return f"{fmt_pct(share)} of reports arrive within {promise_days:g} days"
 
 
@@ -307,7 +330,7 @@ def takeaway_capacity(plan: pd.DataFrame) -> str | None:
     by_skill = short.groupby("skill_type")["gap_hours"].sum().sort_values(ascending=False)
     top = str(by_skill.index[0])
     first = short[short["skill_type"] == top]["month"].min()
-    return f"Shortfalls concentrate in {top} from {fmt_month(first)}"
+    return f"Before hiring, shortfalls concentrate in {top} from {fmt_month(first)}"
 
 
 def takeaway_cost_split(parts: Mapping[str, float]) -> str | None:
@@ -536,10 +559,20 @@ def fig_turnaround_hist(
     *,
     promise_days: float = 14,
     p90: float | None = None,
+    urgent_days: float | None = None,
     for_readme: bool = False,
 ) -> go.Figure:
-    """Turnaround of every delivered report (all repeats pooled), 1-day bins."""
-    values = outcomes["turnaround_days"].dropna()
+    """Turnaround of every delivered, scored report (all repeats pooled), 1-day bins.
+
+    Censored requests (due after the year ends) are left out, like in the
+    metrics; unfinished ones have no turnaround and drop out by themselves.
+    ``urgent_days`` (when some requests carry the shorter urgent promise) adds
+    a second promise line, and the title then counts "by the promised date".
+    """
+    if "scored" in outcomes.columns:
+        outcomes = outcomes[outcomes["scored"].astype(bool)]
+    all_values = outcomes["turnaround_days"]
+    values = all_values.dropna()
     color = policy_color(policy)
     fig = go.Figure(
         go.Histogram(
@@ -557,6 +590,14 @@ def fig_turnaround_hist(
         annotation_position="top right",
         annotation_font={"size": 12, "color": NEUTRAL},
     )
+    if urgent_days is not None and urgent_days != promise_days:
+        fig.add_vline(
+            x=urgent_days,
+            line=PROMISE_LINE,
+            annotation_text=f"{urgent_days:g}-day urgent",
+            annotation_position="bottom right",
+            annotation_font={"size": 12, "color": NEUTRAL},
+        )
     if p90 is not None and not math.isnan(p90):
         fig.add_vline(
             x=p90,
@@ -570,7 +611,12 @@ def fig_turnaround_hist(
     n = int(outcomes["seed"].nunique()) if "seed" in outcomes.columns else 1
     return style_figure(
         fig,
-        takeaway_turnaround(values, promise_days) or "Turnaround",
+        (
+            takeaway_on_time_share(outcomes["on_time"])
+            if urgent_days is not None and "on_time" in outcomes.columns
+            else takeaway_turnaround(all_values, promise_days)
+        )
+        or "Turnaround",
         f"Days from request to delivered report · all {n} repeats pooled",
         for_readme=for_readme,
         show_legend=False,
@@ -807,6 +853,13 @@ def fig_demand_vs_forecast(
     """
     fig = go.Figure()
     color = policy_color(policy)
+    if {"requests_min", "requests_max"} <= set(actual.columns) and (
+        actual["requests_min"] != actual["requests_max"]
+    ).any():
+        future = actual[actual["period"] != "history"]
+        add_range_band(
+            fig, future["month"], future["requests_min"], future["requests_max"], color, "Actual"
+        )
     fig.add_trace(
         go.Scatter(
             x=actual["month"],
@@ -855,7 +908,8 @@ def fig_demand_vs_forecast(
     return style_figure(
         fig,
         takeaway_demand(actual, forecast) or "Demand: actual vs forecast",
-        "Requests received per month · last history year and the plan year",
+        "Requests received per month · last history year, then the plan year"
+        " (mean of repeats; band = range)",
         for_readme=for_readme,
     )
 
@@ -882,10 +936,23 @@ def fig_capacity_heatmap(plan: pd.DataFrame, *, for_readme: bool = False) -> go.
 
     gap, req, avail = grid("gap_hours"), grid("required_hours"), grid("available_hours")
     limit = float(abs(plan["gap_hours"]).max()) or 1.0
+    # "after planned hires" (an M4 extra column) goes in the hover when present.
+    after = (
+        grid("gap_after_hires_hours")
+        if "gap_after_hires_hours" in plan.columns
+        else gap * float("nan")
+    )
     custom = [
-        [[r, a] for r, a in zip(req_row, avail_row, strict=True)]
-        for req_row, avail_row in zip(req.to_numpy(), avail.to_numpy(), strict=True)
+        [[r, a, g] for r, a, g in zip(req_row, avail_row, after_row, strict=True)]
+        for req_row, avail_row, after_row in zip(
+            req.to_numpy(), avail.to_numpy(), after.to_numpy(), strict=True
+        )
     ]
+    after_line = (
+        "<br>After planned hires %{customdata[2]:+,.0f} h"
+        if "gap_after_hires_hours" in plan.columns
+        else ""
+    )
     fig = go.Figure(
         go.Heatmap(
             z=gap.to_numpy(),
@@ -899,7 +966,9 @@ def fig_capacity_heatmap(plan: pd.DataFrame, *, for_readme: bool = False) -> go.
             colorbar={"title": {"text": "Hours short (+) / spare (−)"}},
             hovertemplate=(
                 "%{y} · %{x|%b %Y}<br>Required %{customdata[0]:,.0f} h"
-                "<br>Available %{customdata[1]:,.0f} h<br>Gap %{z:+,.0f} h<extra></extra>"
+                "<br>Available %{customdata[1]:,.0f} h<br>Gap %{z:+,.0f} h"
+                + after_line
+                + "<extra></extra>"
             ),
         )
     )
@@ -908,7 +977,8 @@ def fig_capacity_heatmap(plan: pd.DataFrame, *, for_readme: bool = False) -> go.
     return style_figure(
         fig,
         takeaway_capacity(plan) or "Capacity gap",
-        "Hours of work needed minus hours available, per skill and month",
+        "Hours of work needed minus hours the starting team can give, per skill and month"
+        " (before planned hires)",
         for_readme=for_readme,
         height=140 + 26 * len(order),
     )

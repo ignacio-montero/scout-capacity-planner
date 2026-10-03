@@ -64,8 +64,14 @@ def cmd_data(args: argparse.Namespace) -> int:
     )
     print(
         f"start load: target {params.demand.start_load:.2f}, "
-        f"realised month 0 {generate.realised_start_load(world, params):.3f}"
+        f"realised month 0 {generate.realised_start_load(world, params):.3f} (deseasonalised)"
     )
+    print(
+        f"January load incl. seasonality: expected {generate.month0_peak_load(params):.3f}, "
+        f"realised {generate.realised_start_load(world, params, deseasonalised=False):.3f}"
+    )
+    urgent = req["urgent"].mean() if len(req) else 0.0
+    print(f"urgent requests: {urgent:.1%} (due in {params.demand.urgent_turnaround_days} days)")
     print(f"at risk from day one (future live views): {generate.at_risk_share(world):.1%}")
     return 0
 

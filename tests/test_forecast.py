@@ -38,9 +38,9 @@ def monthly_total(fc: pd.DataFrame, column: str = "requests_p50") -> pd.Series:
 
 
 def test_hours_per_request_without_automation_by_hand() -> None:
-    # desk (4+10)/2 = 7, live 0.4 x 8 = 3.2, write-up (2+4)/2 = 3
+    # desk (4+10)/2 = 7, live 0.4 x 0.85 (urgent never live) x 8 = 2.72, write-up (2+4)/2 = 3
     assert f.automation_factor(P) == 1.0
-    assert f.hours_per_request(P) == pytest.approx(13.2)
+    assert f.hours_per_request(P) == pytest.approx(12.72)
 
 
 def test_hours_per_request_with_automation_by_hand() -> None:
@@ -48,7 +48,7 @@ def test_hours_per_request_with_automation_by_hand() -> None:
     # works (0.85): 7 x 0.6 = 4.2 h; fails (0.15): 7 + 1 overhead = 8 h
     expected_desk = 0.85 * 4.2 + 0.15 * 8.0  # 4.77
     assert f.automation_factor(p) * 7 == pytest.approx(expected_desk)
-    assert f.hours_per_request(p) == pytest.approx(expected_desk + 3.2 + 3.0)
+    assert f.hours_per_request(p) == pytest.approx(expected_desk + 2.72 + 3.0)
 
 
 @pytest.mark.parametrize(
@@ -71,9 +71,9 @@ def test_automation_factor_edge_cases(
 
 
 def test_hours_per_request_variance_by_hand() -> None:
-    # desk U(4,10): (10-4)^2/12 = 3; live 8 h with p 0.4: 0.4*0.6*64 = 15.36;
-    # write-up U(2,4): 4/12.
-    assert f.hours_per_request_variance(P) == pytest.approx(3 + 15.36 + 4 / 12)
+    # desk U(4,10): (10-4)^2/12 = 3; live 8 h with effective p 0.34 (0.4 x 0.85,
+    # urgent never live): 0.34*0.66*64 = 14.3616; write-up U(2,4): 4/12.
+    assert f.hours_per_request_variance(P) == pytest.approx(3 + 14.3616 + 4 / 12)
 
 
 def test_hours_per_request_variance_with_automation_by_hand() -> None:
@@ -81,7 +81,7 @@ def test_hours_per_request_variance_with_automation_by_hand() -> None:
     # desk X = 0.6 D (p 0.85) or D + 1 (p 0.15), D ~ U(4,10): E[D] 7, E[D^2] 52.
     e1 = 0.85 * 0.6 * 7 + 0.15 * 8
     e2 = 0.85 * 0.36 * 52 + 0.15 * (52 + 2 * 7 + 1)
-    assert f.hours_per_request_variance(p) == pytest.approx(e2 - e1**2 + 15.36 + 4 / 12)
+    assert f.hours_per_request_variance(p) == pytest.approx(e2 - e1**2 + 14.3616 + 4 / 12)
 
 
 def test_forecast_hours_mean_and_spread(built: tuple[pd.DataFrame, pd.DataFrame]) -> None:

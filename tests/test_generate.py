@@ -66,7 +66,7 @@ CONTRACT_COLUMNS = {  # DATA_CONTRACTS.md section 1, plus the M1 additions
     "fixtures": ["fixture_id", "date", "league", "region", "home_club", "away_club"],
     "requests": [
         "request_id", "client_club", "player_club", "skill_type", "received_date", "due_date",
-        "needs_live_view", "desk_hours", "writeup_hours", "period", "rework_draw",
+        "urgent", "needs_live_view", "desk_hours", "writeup_hours", "period", "rework_draw",
         "at_risk_day_one",
     ],
 }  # fmt: skip
@@ -115,7 +115,10 @@ def test_no_duplicate_ids(world: g.World) -> None:
 
 
 def test_id_formats(world: g.World) -> None:
-    assert world.scouts["scout_id"].str.fullmatch(r"S\d{3}").all()
+    ft = world.scouts["employment"] == "full_time"
+    assert world.scouts.loc[ft, "scout_id"].str.fullmatch(r"FT\d{3}").all()
+    assert world.scouts.loc[~ft, "scout_id"].str.fullmatch(r"FL\d{3}").all()
+    assert world.scouts["scout_id"].iloc[0] == "FT001"
     assert world.fixtures["fixture_id"].str.fullmatch(r"F\d{5}").all()
     assert world.requests["request_id"].str.fullmatch(r"R\d{5}").all()
 
@@ -330,10 +333,22 @@ def test_default_skills_respect_the_range_and_are_mostly_home_region(world: g.Wo
 
 
 def test_every_region_has_scouts_in_proportion_to_demand(world: g.World) -> None:
+    """Home regions are drawn per scout from the demand mix (binomial counts)."""
     counts = world.scouts["home_region"].value_counts()
+    n = len(world.scouts)
     for region, share in g.REGION_DEMAND_SHARE.items():
         assert counts[region] >= 2
-        assert counts[region] == pytest.approx(share * len(world.scouts), abs=1)
+        sd = (n * share * (1 - share)) ** 0.5
+        assert counts[region] == pytest.approx(share * n, abs=2.5 * sd)
+
+
+def test_short_regions_are_topped_up_to_two_scouts() -> None:
+    homes = ["Iberia"] * 7 + ["SouthAmerica"]
+    g._repair_home_regions(homes, priority=[0.1 * i for i in range(8)])
+    assert all(homes.count(r) >= 2 for r in g.REGIONS)
+    homes = ["Iberia"] * 7  # fewer than 8 scouts: left alone
+    g._repair_home_regions(homes, priority=[0.0] * 7)
+    assert homes == ["Iberia"] * 7
 
 
 def test_former_clubs_are_known_clubs(world: g.World) -> None:
@@ -488,10 +503,18 @@ def test_live_view_window() -> None:
 
 
 def test_at_risk_share_is_small_but_not_zero(world: g.World) -> None:
+    req = world.requests
     assert 0.02 <= g.at_risk_share(world, "future") <= 0.08
     assert 0.01 <= g.at_risk_share(world, "history") <= 0.10
-    req = world.requests
     assert not req.loc[~req["needs_live_view"], "at_risk_day_one"].any()
+    assert not req.loc[req["urgent"], "at_risk_day_one"].any()  # no live view, no risk
+
+
+def test_urgent_requests_never_need_a_live_view(world: g.World) -> None:
+    req = world.requests
+    assert not (req["urgent"] & req["needs_live_view"]).any()
+    assert req["needs_live_view"].mean() == pytest.approx(g.effective_live_view_share(P), abs=0.02)
+    assert g.effective_live_view_share(P) == pytest.approx(0.40 * 0.85)
 
 
 def test_at_risk_flags_agree_with_a_brute_force_search(world: g.World) -> None:
@@ -511,11 +534,16 @@ def test_at_risk_flags_agree_with_a_brute_force_search(world: g.World) -> None:
 def test_request_attributes_follow_the_parameters(world: g.World) -> None:
     req = world.requests
     d = P.demand
-    assert ((req["due_date"] - req["received_date"]).map(lambda x: x.days) == 14).all()
+    promised = (req["due_date"] - req["received_date"]).map(lambda x: x.days)
+    assert (promised[~req["urgent"]] == d.turnaround_days).all()
+    assert (promised[req["urgent"]] == d.urgent_turnaround_days).all()
+    assert req["urgent"].mean() == pytest.approx(d.urgent_share, abs=0.02)
     assert req["desk_hours"].between(*d.desk_hours).all()
     assert req["writeup_hours"].between(*d.writeup_hours).all()
     assert req["desk_hours"].mean() == pytest.approx(np.mean(d.desk_hours), abs=0.1)
-    assert req["needs_live_view"].mean() == pytest.approx(d.live_view_share, abs=0.02)
+    assert req.loc[~req["urgent"], "needs_live_view"].mean() == pytest.approx(
+        d.live_view_share, abs=0.02
+    )
     assert ((req["rework_draw"] >= 0) & (req["rework_draw"] < 1)).all()
     assert req["rework_draw"].mean() == pytest.approx(0.5, abs=0.02)
     club_region = {c.name: c.region for c in g.CLUBS}
@@ -580,14 +608,16 @@ def test_history_volume_peaks_in_the_transfer_windows(world: g.World) -> None:
     assert set(by_month.nlargest(4).index) == {1, 6, 7, 8}
     # January is a peak of its own (above December and February). It is not
     # necessarily the yearly maximum: organic growth lifts July above it.
-    assert by_month[1] > 1.3 * max(by_month[12], by_month[2])
+    # Expected ratios are ~1.48 (Dec) and ~1.40 (Feb); 1.15 leaves room for noise.
+    assert by_month[1] > 1.15 * max(by_month[12], by_month[2])
 
 
 def test_calibration_identity() -> None:
     expected_work = g.base_monthly_volume(P) * g.expected_hours_per_request(P)
     assert expected_work / g.team_available_hours_per_month(P) == pytest.approx(0.70)
-    # Default numbers, for orientation: 7 + 0.4 x 8 + 3 = 13.2 h per request.
-    assert g.expected_hours_per_request(P) == pytest.approx(13.2)
+    # Default numbers, for orientation: 7 + 0.4 x 0.85 x 8 + 3 = 12.72 h per request
+    # (urgent requests, 15%, never need a live view).
+    assert g.expected_hours_per_request(P) == pytest.approx(12.72)
 
 
 def test_rate_at_start_is_the_calibrated_base() -> None:
@@ -643,9 +673,16 @@ def test_history_grows_organically(world: g.World) -> None:
 
 
 def test_history_and_future_meet_without_a_jump(world: g.World) -> None:
-    per_day = deseasonalised_daily(monthly_counts(world.requests))
-    last_hist, first_future = per_day[47], per_day[48]
-    assert first_future / last_hist == pytest.approx(1.0, abs=0.2)
+    """The rate model is continuous at SIM_START, and both sides realise it."""
+    start = np.datetime64(g.SIM_START, "D")
+    before, after = g.daily_rate(P, np.array([start - np.timedelta64(1, "D"), start]))
+    season = g.seasonal_index(1.0)
+    assert (after / season[0]) / (before / season[11]) == pytest.approx(1.0, abs=1e-3)
+    counts = monthly_counts(world.requests)
+    for month in (g.add_months(g.SIM_START, -1), g.SIM_START):  # Dec 2026, Jan 2027
+        days = g._day_range(month, g.add_months(month, 1) - dt.timedelta(days=1))
+        expected = g.daily_rate(P, days).sum()
+        assert counts[pd.Timestamp(month)] == pytest.approx(expected, rel=0.2)
 
 
 def test_growth_ceiling_covers_every_allowed_actual_growth() -> None:
@@ -655,3 +692,167 @@ def test_growth_ceiling_covers_every_allowed_actual_growth() -> None:
     metadata = DemandParams.model_fields["actual_growth"].metadata
     upper = next(m.le for m in metadata if hasattr(m, "le"))
     assert upper == g.GROWTH_CEILING
+
+
+@pytest.mark.parametrize(
+    ("name", "key"),
+    [
+        ("START_LOAD_CEILING", "start_load"),
+        ("SEASONALITY_STRENGTH_CEILING", "seasonality_strength"),
+    ],
+)
+def test_thinning_ceilings_are_the_parameter_bounds(name: str, key: str) -> None:
+    from scout_planner.config import DemandParams
+
+    metadata = DemandParams.model_fields[key].metadata
+    assert next(m.le for m in metadata if hasattr(m, "le")) == getattr(g, name)
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {},
+        {"demand.start_load": 1.2, "demand.seasonality_strength": 2.0},
+        {"demand.start_load": 0.3, "demand.seasonality_strength": 0.0},
+        {"demand.actual_growth": 6.0, "demand.seasonality_strength": 0.4},
+    ],
+)
+def test_the_ceiling_bounds_the_rate_every_day(overrides: dict) -> None:
+    params = apply_overrides(P, overrides)
+    days = g._day_range(g.history_start(params), g.sim_end(params))
+    assert (g.daily_rate(params, days) <= g.ceiling_daily_rate(params, days) * (1 + 1e-12)).all()
+
+
+# --- common random numbers: start load and seasonality (thinning) ---------------------------
+
+
+def test_start_load_worlds_nest(world: g.World) -> None:
+    """0.70 vs 0.75: every request of the quieter world appears, identical, in the busier one."""
+    busier = g.generate_world(apply_overrides(P, {"demand.start_load": 0.75}))
+    for period in (history, future):
+        small, big = _content(period(world)), _content(period(busier))
+        assert small <= big
+        assert len(big) > len(small)
+
+
+def test_seasonality_worlds_nest_month_by_month(world: g.World) -> None:
+    """Stronger seasonality raises peak months and lowers quiet ones: nested both ways."""
+    stronger = g.generate_world(apply_overrides(P, {"demand.seasonality_strength": 1.1}))
+    peak = {m + 1 for m, v in enumerate(g.SEASONALITY_PROFILE) if v > 1}
+
+    def split(req: pd.DataFrame) -> tuple[set[tuple], set[tuple]]:
+        is_peak = req["received_date"].map(lambda d: d.month in peak)
+        return _content(req[is_peak]), _content(req[~is_peak])
+
+    base_peak, base_quiet = split(world.requests)
+    new_peak, new_quiet = split(stronger.requests)
+    assert base_peak <= new_peak and new_quiet <= base_quiet
+    assert len(new_peak) > len(base_peak) and len(new_quiet) < len(base_quiet)
+
+
+# --- urgent requests ------------------------------------------------------------------------
+
+
+def test_urgent_share_zero_reproduces_the_single_promise(world: g.World) -> None:
+    flat = g.generate_world(apply_overrides(P, {"demand.urgent_share": 0.0}))
+    req = flat.requests
+    assert not req["urgent"].any()
+    assert ((req["due_date"] - req["received_date"]).map(lambda x: x.days) == 14).all()
+    changed = ("due_date", "urgent", "needs_live_view", "at_risk_day_one")
+    same = [c for c in req.columns if c not in changed]
+    pd.testing.assert_frame_equal(world.requests[same], req[same])
+    assert_world_equal(world, flat, skip=("requests",))
+    # Live flags come from the same draw: with no urgent requests, every request
+    # under the live-view share needs one again (a superset of the default's).
+    assert (world.requests["needs_live_view"] <= req["needs_live_view"]).all()
+    assert req["needs_live_view"].mean() == pytest.approx(P.demand.live_view_share, abs=0.02)
+
+
+def test_urgency_is_nested_across_shares(world: g.World) -> None:
+    fewer = g.generate_world(apply_overrides(P, {"demand.urgent_share": 0.05})).requests
+    assert (fewer["urgent"] <= world.requests["urgent"]).all()
+    assert fewer["urgent"].sum() < world.requests["urgent"].sum()
+
+
+def test_urgent_flag_round_trips_to_the_domain(world: g.World) -> None:
+    requests = g.requests_from_frame(world.requests)
+    assert sum(r.urgent for r in requests) == int(world.requests["urgent"].sum())
+    urgent = next(r for r in requests if r.urgent)
+    assert (urgent.due_date - urgent.received_date).days == P.demand.urgent_turnaround_days
+    day = dt.date(2027, 1, 4)
+    plain = Request("R1", "A", "B", "MID-Iberia-ES", day, day, False, 5.0, 2.0)
+    assert plain.urgent is False
+
+
+# --- January visibility -----------------------------------------------------------------------
+
+
+def test_month0_peak_load_includes_january_seasonality(world: g.World) -> None:
+    peak = g.month0_peak_load(P)
+    january = g.seasonal_index(1.0)[0]
+    # Above the average-month start load by January's multiplier and a little growth.
+    assert peak == pytest.approx(0.70 * january, rel=0.08)
+    assert peak > 0.70 * january
+    assert g.realised_start_load(world, P, deseasonalised=False) == pytest.approx(peak, abs=0.1)
+    flat = apply_overrides(P, {"demand.seasonality_strength": 0.0, "demand.actual_growth": 1.0})
+    assert g.month0_peak_load(flat) == pytest.approx(0.70)
+    bigger = apply_overrides(P, {"team.freelance_count": 26})
+    assert g.month0_peak_load(bigger) < peak
+
+
+# --- stable per-scout entities ------------------------------------------------------------------
+
+
+def scout_record(world: g.World, sid: str) -> tuple:
+    s = world.scouts.set_index("scout_id").loc[sid]
+    un = world.scout_unavailability
+    wh = world.scout_weekly_hours
+    return (
+        s["name"],
+        s["employment"],
+        s["home_region"],
+        tuple(s["former_clubs"]),
+        tuple(un.loc[un["scout_id"] == sid, "date"]),
+        tuple(wh.loc[wh["scout_id"] == sid, "hours"]),
+    )
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"team.freelance_count": P.team.freelance_count + 10},
+        {"team.full_time_count": P.team.full_time_count + 1},
+    ],
+)
+def test_growing_the_team_keeps_every_existing_scout(world: g.World, overrides: dict) -> None:
+    """Same id => same person: home, name, former clubs, leave, weekly hours, own skill draw.
+
+    The only allowed difference is the coverage repair, which may add a skill
+    to a scout in one team and not in the other.
+    """
+    params = apply_overrides(P, overrides)
+    bigger = g.generate_world(params)
+    old_ids = list(world.scouts["scout_id"])
+    assert (
+        list(bigger.scouts["scout_id"])[: P.team.full_time_count]
+        == old_ids[: P.team.full_time_count]
+    )
+    assert set(old_ids) < set(bigger.scouts["scout_id"])
+    for sid in old_ids:
+        assert scout_record(world, sid) == scout_record(bigger, sid), sid
+
+    before, after = g._draw_team(P, P.sim.seed), g._draw_team(params, P.sim.seed)
+    drawn_after = dict(zip(after.ids, after.drawn_skills, strict=True))
+    skills_after = dict(zip(after.ids, after.skills, strict=True))
+    for sid, drawn, skills in zip(before.ids, before.drawn_skills, before.skills, strict=True):
+        assert drawn_after[sid] == drawn, sid  # each scout's own draw is untouched
+        assert drawn <= skills and drawn <= skills_after[sid]  # repair only adds
+
+
+def test_replications_share_the_team_but_not_its_luck(world: g.World) -> None:
+    rep = g.generate_world(P, replication=1)
+    pd.testing.assert_frame_equal(world.scouts, rep.scouts)
+    pd.testing.assert_frame_equal(world.fixtures, rep.fixtures)
+    assert not world.scout_unavailability.equals(rep.scout_unavailability)
+    assert not world.scout_weekly_hours.equals(rep.scout_weekly_hours)
+    assert not world.requests["received_date"].equals(rep.requests["received_date"])

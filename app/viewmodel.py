@@ -136,9 +136,18 @@ _PARAMS: tuple[ParamUI, ...] = (
     ),
     ParamUI(
         "demand.start_load", "Starting workload", "demand", "pct",
-        _help("How busy the starting team is in month one. 70% means arriving work needs 70% "
-              "of the team's usable hours. Sets the base volume.", "demand.start_load"),
+        _help("How busy the starting team is in an average month at the start of the year. "
+              "70% means arriving work needs 70% of the team's usable hours. January is a "
+              "transfer window and peaks at about 1.35x that (70% becomes roughly 95%), "
+              "before any hire can join. Sets the base volume.", "demand.start_load"),
         lambda v: fmt_pct(v, 0), 30, 120, 5, percent=True,
+    ),
+    ParamUI(
+        "demand.urgent_share", "Urgent requests (7-day)", "demand", "pct",
+        _help("Share of requests promised in the shorter urgent time (7 days by default; "
+              "change it with `demand.urgent_turnaround_days` in the advanced settings). "
+              "Urgent work is where the assignment rule matters most.", "demand.urgent_share"),
+        lambda v: fmt_pct(v, 0), 0, 100, 5, percent=True,
     ),
     ParamUI(
         "demand.live_view_share", "Live-view share", "demand", "pct",
@@ -505,8 +514,12 @@ def _caution_phrase(q: float) -> str:
     }.get(round(q, 4), f"with a P{round(q * 100)} buffer")
 
 
-def describe_params(params: Params) -> list[str]:
-    """The four review-card sentences, values in bold (markdown)."""
+def describe_params(params: Params, january_load: float | None = None) -> list[str]:
+    """The four review-card sentences, values in bold (markdown).
+
+    ``january_load``: the expected month-0 load with the transfer-window peak
+    (``generate.month0_peak_load``); ``start_load`` is the average-month figure.
+    """
     d, c, t, a, s = params.demand, params.capacity_plan, params.team, params.assignment, params.sim
     cadence = "every day" if a.cadence == "daily" else "once a week"
     unit = "task by task" if a.unit == "task" else "desk review and write-up together"
@@ -520,9 +533,21 @@ def describe_params(params: Params) -> list[str]:
     else:
         tool = "**off**"
     repeats = "1 repeat" if s.seeds == 1 else f"{s.seeds} repeats"
+    january = (
+        f" (about **{fmt_pct(january_load, 0)}** in January, the transfer window)"
+        if january_load is not None and not math.isnan(january_load)
+        else ""
+    )
+    urgent = (
+        f" **{fmt_pct(d.urgent_share, 0)}** of requests are urgent "
+        f"({d.urgent_turnaround_days}-day promise)."
+        if d.urgent_share
+        else ""
+    )
     return [
         f"Demand grows **{fmt_growth(d.actual_growth)}** over the year, starting at "
-        f"**{fmt_pct(d.start_load, 0)}** of the team's capacity.",
+        f"**{fmt_pct(d.start_load, 0)}** of the team's capacity in an average month{january}."
+        + urgent,
         f"The agency **hires for {fmt_growth(c.assumed_growth)}**, "
         f"**{_caution_phrase(c.quantile)}**,"
         f" and planned hires **{'join' if t.follow_hiring_plan else 'never join'}**.",
@@ -659,7 +684,8 @@ def kpi_cards(summary: Summary, params: Params, late: MetricStat | None = None) 
     """The four KPI cards. ``late`` (exact, from seeds.parquet) overrides the approximation."""
     target = params.sim.target_on_time
     promise = params.demand.turnaround_days
-    seeds = params.sim.seeds
+    seeds = summary.n_seeds or params.sim.seeds
+    single = seeds == 1
     on_time = summary.stat("on_time_rate")
     p90 = summary.stat("p90_turnaround_days")
     cost = summary.stat("cost_total")
@@ -674,7 +700,8 @@ def kpi_cards(summary: Summary, params: Params, late: MetricStat | None = None) 
             fmt_pct(on_time.mean if on_time else None),
             f"{fmt_pts(on_time.mean - target)} vs {fmt_pct(target, 0)} target" if on_time else None,
             "normal",
-            f"Range {_range(on_time, fmt_pct)} {repeats}{risk}",
+            ("Single repeat, no range" if single else f"Range {_range(on_time, fmt_pct)} {repeats}")
+            + risk,
             "Share of reports delivered within the promised days.",
         ),
         Kpi(
@@ -682,8 +709,8 @@ def kpi_cards(summary: Summary, params: Params, late: MetricStat | None = None) 
             fmt_days(p90.mean if p90 else None),
             f"{fmt_days_delta(p90.mean - promise)} vs {promise}-day promise" if p90 else None,
             "inverse",
-            f"Average {fmt_days(summary.mean('mean_turnaround_days'))} · range "
-            f"{_range(p90, lambda v: f'{v:.1f}')}",
+            f"Average {fmt_days(summary.mean('mean_turnaround_days'))}"
+            + ("" if single else f" · range {_range(p90, lambda v: f'{v:.1f}')}"),
             "9 in 10 reports were delivered within this many days.",
         ),
         Kpi(
@@ -691,7 +718,7 @@ def kpi_cards(summary: Summary, params: Params, late: MetricStat | None = None) 
             fmt_cost_k(cost.mean if cost else None),
             None,
             "off",
-            f"Range {_range(cost, fmt_cost_k)}",
+            "Single repeat, no range" if single else f"Range {_range(cost, fmt_cost_k)}",
             "Salaries + freelance hours + late penalties + tool licence, for the year.",
         ),
         Kpi(
@@ -700,7 +727,7 @@ def kpi_cards(summary: Summary, params: Params, late: MetricStat | None = None) 
             None,
             "off",
             (
-                f"of {fmt_count(n_req)} requests ({fmt_pct(late_mean / n_req)})"
+                f"of {fmt_count(n_req)} scored requests ({fmt_pct(late_mean / n_req)})"
                 if late_mean is not None and n_req
                 else DASH
             ),
@@ -801,6 +828,8 @@ METRIC_UI: tuple[MetricUI, ...] = (
     MetricUI("late_reports", "Late reports", "lower", fmt_count,
              lambda v: fmt_count(v, signed=True)),
     MetricUI("n_at_risk_day_one", "At risk from day one", "—", fmt_count,
+             lambda v: fmt_count(v, signed=True)),
+    MetricUI("n_censored", "Not scored (due after year end)", "—", fmt_count,
              lambda v: fmt_count(v, signed=True)),
     MetricUI("cost_total", "Total cost", "lower", fmt_cost_k, lambda v: fmt_cost_k(v, signed=True)),
     MetricUI("cost_salaried", "Salaried cost", "—", fmt_cost_k,
@@ -923,3 +952,49 @@ def badge_markdown(spec: tuple[str, str, str] | None) -> str:
         return ""
     color, icon, label = spec
     return f":{color}-badge[{icon} {label}]"
+
+
+# --- solver diagnostics (summary.json "diagnostics") -----------------------------------
+
+DIAGNOSTIC_LABELS: tuple[tuple[str, str, Callable[[Any], str]], ...] = (
+    ("assignment_runs", "Assignment rounds", fmt_count),
+    ("optimiser_solves", "Optimiser solves", fmt_count),
+    ("mean_solve_seconds", "Average solve time", lambda v: f"{v:.2f} s"),
+    ("max_solve_seconds", "Longest solve", lambda v: f"{v:.2f} s"),
+    ("wall_clock_hits", "Stopped by the time limit", fmt_count),
+    ("fallbacks", "Fell back to earliest deadline first", fmt_count),
+    ("live_view_retargets", "Live views moved to another match", fmt_count),
+    ("reworks", "Pre-screen outputs redone", fmt_count),
+)
+
+
+def diagnostics_table(diagnostics: Mapping[str, Any]) -> pd.DataFrame:
+    """Totals over repeats as ``What, Count``; unknown keys and the per-repeat list are skipped."""
+    rows = []
+    for key, label, fmt in DIAGNOSTIC_LABELS:
+        value = diagnostics.get(key)
+        if isinstance(value, int | float) and not isinstance(value, bool):
+            rows.append({"What": label, "Total over repeats": fmt(value)})
+    return pd.DataFrame(rows, columns=["What", "Total over repeats"])
+
+
+def diagnostics_warning(diagnostics: Mapping[str, Any]) -> str | None:
+    """A visible warning when the optimiser didn't always finish its own way."""
+    stops = int(diagnostics.get("wall_clock_hits") or 0)
+    fallbacks = int(diagnostics.get("fallbacks") or 0)
+    if stops <= 0 and fallbacks <= 0:
+        return None
+    parts = []
+    if stops:
+        parts.append(
+            f"stopped at its time limit {fmt_count(stops)} time{'s' if stops != 1 else ''}"
+        )
+    if fallbacks:
+        parts.append(
+            f"fell back to earliest deadline first {fmt_count(fallbacks)} "
+            f"time{'s' if fallbacks != 1 else ''}"
+        )
+    return (
+        "The optimiser " + " and ".join(parts) + ". Those rounds were not planned by the "
+        "optimiser, so this run partly reflects the simpler rule. See Solver diagnostics."
+    )

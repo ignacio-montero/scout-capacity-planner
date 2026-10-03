@@ -42,25 +42,35 @@ Modelling choices
 * **Request attributes.** Skill type from a fixed demand mix; player club
   uniform among the clubs of the skill's region; client club uniform among
   all other clubs; desk and write-up hours uniform on their ranges;
-  ``needs_live_view`` with probability ``live_view_share``; a uniform
+  ``needs_live_view`` with probability ``live_view_share``, except that
+  urgent requests never need one (an express report is video-based), so the
+  effective share is ``live_view_share x (1 - urgent_share)``
+  (``effective_live_view_share``); a uniform
   ``rework_draw`` pre-drawn per request (rework iff ``rework_draw <
-  rework_rate``); ``due_date = received + turnaround_days``.
+  rework_rate``); ``urgent`` with probability ``urgent_share``.
+  ``due_date = received + urgent_turnaround_days`` for urgent requests and
+  ``received + turnaround_days`` otherwise. Mixed deadlines are what make
+  earliest-due-first differ from first-come-first-served.
 * **At risk from day one.** A live view must happen in
-  ``[received + 2, due - 1]`` (``live_view_window``): two days to arrange it,
-  one day to write it up. A live-view request whose player club has no
-  fixture in that window is flagged ``at_risk_day_one``.
+  ``[received + 2, due - 1]`` (``live_view_window``, on the request's own due
+  date): two days to arrange it, one day to write it up. A live-view request
+  whose player club has no fixture in that window is flagged
+  ``at_risk_day_one``. Urgent requests have no live view, so are never at risk.
 * **Fixtures.** Each league plays a repeating double round-robin: one round
   per weekend (Fri-Mon, mostly Sat/Sun) plus a midweek round every few weeks,
   except during its region's breaks (a ~3-week summer break and a short winter
   break, staggered by region; the South American calendar has its long break
   over the southern summer). Breaks are what create at-risk requests.
-* **Scouts.** Home regions follow the demand mix (quota sampling, at least 2
-  scouts per region when the team has 8 or more). Skills are mostly from the
-  home region; a repair step then guarantees every skill type has at least 2
-  holders whose home region is the skill's region, which is what live views
-  need (D-008), and so also at least 2 holders overall. Repair may push a scout
-  above ``skills_per_scout``'s max only if no other home-region scout has room.
-  0-3 former clubs, biased to the home region (conflict of interest).
+* **Scouts are stable entities.** Ids are ``FT001``.. and ``FL001``.., and
+  each scout draws everything from its own streams keyed by id
+  (``scout_stream``): home region (from the demand mix), skills (mostly
+  home-region), name, 0-3 former clubs (biased to the home region), leave and
+  weekly hours. So adding scouts never changes an existing one. Two
+  deterministic team-level repairs run last and only act when needed: every
+  region gets at least 2 residents (teams of 8+), and every skill type gets at
+  least 2 holders living in its region, which live views need (D-008). Skill
+  repair may push a scout above ``skills_per_scout``'s max only if no other
+  home-region scout has room.
 * **Availability.** Full-time: 37.5 h every week; leave of
   ``leave_days_per_year`` weekdays (pro rata for the horizon) in blocks of
   10/5/5/3/2 days placed at random. Freelancers: weekly hours pre-drawn per
@@ -81,12 +91,19 @@ entity, so a longer array only *appends* numbers. Consequences, all tested:
 * ``assignment.*``, ``automation.*``, ``capacity_plan.*`` and ``cost.*`` do not
   change any random draw. (``cost.*`` only changes the salary/rate columns of
   ``scouts``, which echo it.)
-* **Thinning.** Future arrivals are drawn at a ceiling rate (growth
-  ``GROWTH_CEILING``) and each candidate is kept with probability
-  ``rate / ceiling``, using its own pre-drawn uniform (Lewis-Shedler
-  thinning). So the requests of a 2x world are a subset of those of a 4x
-  world with the same seed: runs that differ in growth share their common
-  requests instead of drawing unrelated ones.
+* **Thinning (D-019).** Arrivals are drawn at a ceiling rate
+  (``ceiling_daily_rate``: the maximum start load, the maximum seasonal
+  multiplier of each month, and from ``SIM_START`` on the maximum growth)
+  and each candidate is kept with probability ``rate / ceiling``, using its
+  own pre-drawn uniform (Lewis-Shedler thinning). So a 2x world's requests
+  are a subset of a 4x world's, a 0.70 start load's of a 0.75 one's, and a
+  stronger seasonality adds requests in peak months and removes some in
+  quiet ones: runs share their common requests instead of drawing unrelated
+  ones.
+* Team size, hours and live-view share do not change the arrival stream at
+  all (reference calibration); urgency and live-view flags are nested across
+  their shares; per-scout streams make every existing scout identical when
+  the team grows.
 """
 
 from __future__ import annotations
@@ -106,7 +123,7 @@ import pyarrow.parquet as pq
 
 from scout_planner.config import FULL_TIME_WEEKLY_HOURS, WEEKS_PER_YEAR, Params
 from scout_planner.domain import Fixture, Request, Scout
-from scout_planner.rng import make_streams
+from scout_planner.rng import make_stream, make_streams
 
 # --- calendar ----------------------------------------------------------------------
 
@@ -276,9 +293,12 @@ LEAVE_BLOCK_PATTERN = (10, 5, 5, 3, 2)  # leave is taken in blocks of these size
 FREELANCE_DAYS_OFF_PER_YEAR = 6.0  # Poisson mean, single days
 FREELANCE_HOURS_STEP = 0.5  # weekly offers are rounded to half hours
 
-# Future arrivals are drawn at this growth and thinned down to actual_growth.
-# Equal to the upper bound of demand.actual_growth.
-GROWTH_CEILING = 6.0
+# Thinning ceilings (D-019): arrivals are drawn at the highest rate any
+# parameter value allows and thinned down to the run's rate. Each equals the
+# upper bound of its parameter (tests pin them together).
+GROWTH_CEILING = 6.0  # demand.actual_growth
+START_LOAD_CEILING = 1.2  # demand.start_load
+SEASONALITY_STRENGTH_CEILING = 2.0  # demand.seasonality_strength
 
 _FIRST_NAMES: dict[str, tuple[str, ...]] = {
     "Iberia": (
@@ -394,6 +414,7 @@ TABLE_SCHEMAS: dict[str, pa.Schema] = {
             ("skill_type", pa.string()),
             ("received_date", pa.date32()),
             ("due_date", pa.date32()),
+            ("urgent", pa.bool_()),
             ("needs_live_view", pa.bool_()),
             ("desk_hours", pa.float64()),
             ("writeup_hours", pa.float64()),
@@ -474,12 +495,27 @@ def team_available_hours_per_month(params: Params) -> float:
     return (team.full_time_count * full_time_year + team.freelance_count * freelance_year) / 12
 
 
+def effective_live_view_share(params: Params) -> float:
+    """Share of requests that really need a live view: urgent ones never do.
+
+    The live-view and urgency draws are independent uniforms, so this is
+    exactly ``live_view_share x (1 - urgent_share)`` (0.34 by default).
+    """
+    d = params.demand
+    return d.live_view_share * (1.0 - d.urgent_share)
+
+
 def expected_hours_per_request(params: Params) -> float:
-    """Mean work per request without automation: desk + live share x live + write-up."""
+    """Mean work per request without automation: desk + effective live share x live + write-up.
+
+    Used on ``REFERENCE`` for the calibration, so the reference expectation
+    includes the default urgent share and ``start_load`` keeps meaning the
+    default team's average load.
+    """
     d = params.demand
     return (
         float(np.mean(d.desk_hours))
-        + d.live_view_share * d.live_view_hours
+        + effective_live_view_share(params) * d.live_view_hours
         + float(np.mean(d.writeup_hours))
     )
 
@@ -530,6 +566,24 @@ def _demand_multiplier(
     month = days.astype("datetime64[M]").astype(np.int64) % 12
     trend = np.where(t < 0, (1.0 + d.history_growth_per_year) ** t, g**t)
     return seasonal_index(d.seasonality_strength)[month] * trend
+
+
+def ceiling_daily_rate(params: Params, days: np.ndarray) -> np.ndarray:
+    """The thinning envelope: an upper bound of ``daily_rate`` over every value of
+    ``start_load``, ``seasonality_strength`` and (from ``SIM_START`` on)
+    ``actual_growth``, with the run's other parameters.
+
+    The seasonal multiplier ``1 + k (profile - 1)`` is linear in the strength
+    ``k``, so its maximum over ``[0, 2]`` sits at an end: ``max(1, 2 profile - 1)``.
+    """
+    d = params.demand
+    days = np.asarray(days, dtype="datetime64[D]")
+    t = _years_since_start(days)
+    month = days.astype("datetime64[M]").astype(np.int64) % 12
+    season = np.maximum(seasonal_index(0.0), seasonal_index(SEASONALITY_STRENGTH_CEILING))
+    trend = np.where(t < 0, (1.0 + d.history_growth_per_year) ** t, GROWTH_CEILING**t)
+    base_daily = base_monthly_volume(params) / d.start_load * START_LOAD_CEILING
+    return base_daily * 12 / DAYS_PER_YEAR * season[month] * trend
 
 
 def _day_range(start: dt.date, end: dt.date) -> np.ndarray:
@@ -676,24 +730,21 @@ def _pick_weighted(items: Sequence[str], weights: Sequence[float], u: float) -> 
     return items[int(np.searchsorted(cdf, u * cdf[-1], side="right"))]
 
 
-def _region_quotas(n: int) -> dict[str, int]:
-    """Scouts per home region in proportion to demand (largest remainder).
+def _repair_home_regions(homes: list[str], priority: Sequence[float]) -> None:
+    """Give every region at least 2 resident scouts when the team has 8 or more.
 
-    With 2 or more scouts per region available, every region gets at least 2,
-    so every skill type can have 2 home-region holders (D-008).
+    Home regions are drawn per scout, so a small region can come up short by
+    chance (rare for 40 scouts). The fix moves the scout with the highest
+    ``priority`` out of the most populated region; deterministic, and it
+    touches nobody when no region is short. Mutates ``homes`` in place.
     """
-    exact = {r: n * REGION_DEMAND_SHARE[r] for r in REGIONS}
-    quotas = {r: int(exact[r]) for r in REGIONS}
-    by_remainder = sorted(REGIONS, key=lambda r: (-(exact[r] - quotas[r]), REGIONS.index(r)))
-    for r in by_remainder[: n - sum(quotas.values())]:
-        quotas[r] += 1
-    if n >= MIN_HOME_REGION_HOLDERS * len(REGIONS):
-        for r in REGIONS:
-            while quotas[r] < MIN_HOME_REGION_HOLDERS:
-                donor = max(REGIONS, key=lambda x: (quotas[x], -REGIONS.index(x)))
-                quotas[donor] -= 1
-                quotas[r] += 1
-    return quotas
+    if len(homes) < MIN_HOME_REGION_HOLDERS * len(REGIONS):
+        return
+    for region in REGIONS:
+        while homes.count(region) < MIN_HOME_REGION_HOLDERS:
+            donor = max(REGIONS, key=lambda r: (homes.count(r), -REGIONS.index(r)))
+            movers = [i for i, h in enumerate(homes) if h == donor]
+            homes[max(movers, key=lambda i: priority[i])] = region
 
 
 def _draw_skills(home: str, k: int, rng: np.random.Generator) -> set[str]:
@@ -708,16 +759,18 @@ def _draw_skills(home: str, k: int, rng: np.random.Generator) -> set[str]:
 
 
 def _repair_skill_coverage(
-    skills: list[set[str]], homes: list[str], max_skills: int, rng: np.random.Generator
+    skills: list[set[str]], homes: list[str], max_skills: int, priority: Sequence[float]
 ) -> None:
     """Ensure each skill type has ``MIN_HOME_REGION_HOLDERS`` holders living in its region.
 
     Adds the skill to home-region scouts who lack it, preferring those with
-    room under ``max_skills`` and then those with the fewest skills (random
-    tie-break). Falls back to any scout if the region has too few scouts
-    (only possible for teams smaller than 8). Mutates ``skills`` in place.
+    room under ``max_skills``, then those with the fewest skills, then the
+    lowest per-scout ``priority`` (a stable random tie-break: it belongs to the
+    scout, so it does not change when others join). Falls back to any scout if
+    the region has too few scouts (only possible for teams smaller than 8).
+    Mutates ``skills`` in place.
     """
-    tiebreak = rng.permutation(len(skills))
+    tiebreak = priority
     for skill in SKILL_TYPES:
         region = skill_region(skill)
         for pool in ([i for i, h in enumerate(homes) if h == region], range(len(skills))):
@@ -740,53 +793,120 @@ def _draw_former_clubs(home: str, rng: np.random.Generator) -> list[str]:
     return sorted(clubs)
 
 
-def _generate_scouts(params: Params, streams: Mapping[str, np.random.Generator]) -> pd.DataFrame:
-    team, cost = params.team, params.cost
-    n_ft, n_fl = team.full_time_count, team.freelance_count
-    n = n_ft + n_fl
-    width = _id_width(n, 3)
-    ids = [f"S{i:0{width}d}" for i in range(1, n + 1)]
-    employment = ["full_time"] * n_ft + ["freelance"] * n_fl
+def scout_ids(params: Params) -> list[str]:
+    """Initial-team ids: ``FT001``.. for full-timers, then ``FL001``.. for freelancers.
 
-    rng = streams["scouts"]
-    quotas = _region_quotas(n)
-    homes = [r for r in REGIONS for _ in range(quotas[r])]
-    homes = [homes[i] for i in rng.permutation(n)]
+    Prefixing by employment keeps ids stable: one more full-timer is
+    ``FT025`` and every freelancer keeps its id.
+    """
+    team = params.team
+    ft_width = _id_width(team.full_time_count, 3)
+    fl_width = _id_width(team.freelance_count, 3)
+    return [f"FT{i:0{ft_width}d}" for i in range(1, team.full_time_count + 1)] + [
+        f"FL{i:0{fl_width}d}" for i in range(1, team.freelance_count + 1)
+    ]
+
+
+def scout_stream(
+    seed: int, purpose: str, scout_id: str, replication: int = 0
+) -> np.random.Generator:
+    """One scout's own stream for one purpose (per-entity streams, D-015).
+
+    Profile purposes (``SCOUT_PROFILE_PURPOSES``: home, skills, name, former
+    clubs) always come from replication 0, the team being the same in every
+    replication; luck purposes (``scout_leave``, ``scout_hours``) come from
+    ``replication``. Keyed by scout id, so adding scouts never changes anyone
+    else's draws.
+    """
+    rep = 0 if purpose in SCOUT_PROFILE_PURPOSES else replication
+    return make_stream(seed, f"{purpose}.{scout_id}", rep)
+
+
+SCOUT_PROFILE_PURPOSES = ("scout", "scout_name", "scout_clubs")
+_REGION_WEIGHTS = [REGION_DEMAND_SHARE[r] for r in REGIONS]
+
+
+@dataclass(frozen=True, slots=True)
+class _TeamDraw:
+    """The initial team before and after the deterministic repair steps."""
+
+    ids: list[str]
+    employment: list[str]
+    homes: list[str]
+    drawn_skills: list[frozenset[str]]  # each scout's own draw, before coverage repair
+    skills: list[set[str]]  # after coverage repair
+    names: list[str]
+    former: list[list[str]]
+
+
+def _unique_name(home: str, taken: set[str], rng: np.random.Generator) -> str:
+    firsts, lasts = _FIRST_NAMES[home], _SURNAMES[home]
+    for _ in range(1000):
+        name = f"{firsts[int(rng.random() * len(firsts))]} {lasts[int(rng.random() * len(lasts))]}"
+        if name not in taken:
+            return name
+    k = 2  # the region's name space is exhausted: disambiguate with a counter
+    while f"{name} {k}" in taken:
+        k += 1
+    return f"{name} {k}"
+
+
+def _draw_team(params: Params, seed: int) -> _TeamDraw:
+    """Every initial scout from its own streams, then the two team-level repairs.
+
+    Per scout, stream ``scout.<id>`` gives, in order: a home-region uniform, a
+    repair priority, the skill count, then exactly 2 uniforms per skill pick.
+    Names (``scout_name.<id>``) and former clubs (``scout_clubs.<id>``) have
+    their own streams, so a name clash that forces a redraw shifts nothing else.
+    Only the repairs look at the whole team, and they only act when needed.
+    """
+    team = params.team
+    ids = scout_ids(params)
+    employment = ["full_time"] * team.full_time_count + ["freelance"] * team.freelance_count
+    profiles = [scout_stream(seed, "scout", sid) for sid in ids]
+    homes = [_pick_weighted(REGIONS, _REGION_WEIGHTS, rng.random()) for rng in profiles]
+    priority = [float(rng.random()) for rng in profiles]
+    _repair_home_regions(homes, priority)
+
+    lo, hi = team.skills_per_scout
+    drawn = [
+        frozenset(_draw_skills(home, lo + int(rng.random() * (hi - lo + 1)), rng))
+        for home, rng in zip(homes, profiles, strict=True)
+    ]
+    skills = [set(d) for d in drawn]
+    _repair_skill_coverage(skills, homes, hi, priority)
+
     names: list[str] = []
     taken: set[str] = set()
-    for home in homes:
-        while True:
-            first = _FIRST_NAMES[home][int(rng.random() * len(_FIRST_NAMES[home]))]
-            last = _SURNAMES[home][int(rng.random() * len(_SURNAMES[home]))]
-            if f"{first} {last}" not in taken:
-                break
-        taken.add(f"{first} {last}")
-        names.append(f"{first} {last}")
+    for sid, home in zip(ids, homes, strict=True):  # canonical order: FT, then FL
+        names.append(_unique_name(home, taken, scout_stream(seed, "scout_name", sid)))
+        taken.add(names[-1])
+    former = [
+        _draw_former_clubs(home, scout_stream(seed, "scout_clubs", sid))
+        for sid, home in zip(ids, homes, strict=True)
+    ]
+    return _TeamDraw(ids, employment, homes, drawn, skills, names, former)
 
-    rng = streams["skills"]
-    lo, hi = team.skills_per_scout
-    skills = [_draw_skills(home, lo + int(rng.random() * (hi - lo + 1)), rng) for home in homes]
-    _repair_skill_coverage(skills, homes, hi, rng)
 
-    rng = streams["former_clubs"]
-    former = [_draw_former_clubs(home, rng) for home in homes]
-
+def _generate_scouts(params: Params, seed: int) -> pd.DataFrame:
+    draw = _draw_team(params, seed)
+    team, cost = params.team, params.cost
     fl_lo, fl_hi = team.freelance_weekly_hours
-    is_ft = [e == "full_time" for e in employment]
+    is_ft = [e == "full_time" for e in draw.employment]
     return _frame(
         "scouts",
         {
-            "scout_id": ids,
-            "name": names,
-            "employment": employment,
-            "skills": [sorted(s, key=SKILL_TYPES.index) for s in skills],
-            "home_region": homes,
+            "scout_id": draw.ids,
+            "name": draw.names,
+            "employment": draw.employment,
+            "skills": [sorted(s, key=SKILL_TYPES.index) for s in draw.skills],
+            "home_region": draw.homes,
             "min_weekly_hours": [FULL_TIME_WEEKLY_HOURS if ft else fl_lo for ft in is_ft],
             "max_weekly_hours": [FULL_TIME_WEEKLY_HOURS if ft else fl_hi for ft in is_ft],
-            "former_clubs": former,
+            "former_clubs": draw.former,
             "monthly_salary": [cost.full_time_monthly_salary if ft else np.nan for ft in is_ft],
             "hourly_rate": [np.nan if ft else cost.freelance_hourly_rate for ft in is_ft],
-            "joined_month": [0] * n,
+            "joined_month": [0] * len(draw.ids),
         },
     )
 
@@ -829,8 +949,9 @@ def _full_time_leave(
 
 
 def _generate_unavailability(
-    params: Params, scouts: pd.DataFrame, rng: np.random.Generator
+    params: Params, scouts: pd.DataFrame, seed: int, replication: int
 ) -> pd.DataFrame:
+    """Leave (full-time) and days off (freelance), each scout from ``scout_leave.<id>``."""
     start, end = SIM_START, sim_end(params)
     all_days = [start + dt.timedelta(days=k) for k in range((end - start).days + 1)]
     weekdays = [d for d in all_days if d.weekday() < 5]
@@ -838,6 +959,7 @@ def _generate_unavailability(
     leave_total = round(params.team.leave_days_per_year * share_of_year)
     ids, dates, reasons = [], [], []
     for scout_id, employment in zip(scouts["scout_id"], scouts["employment"], strict=True):
+        rng = scout_stream(seed, "scout_leave", scout_id, replication)
         if employment == "full_time":
             days, reason = _full_time_leave(weekdays, leave_total, rng), "leave"
         else:
@@ -858,20 +980,25 @@ def sim_week_starts(params: Params) -> list[dt.date]:
 
 
 def _generate_weekly_hours(
-    params: Params, scouts: pd.DataFrame, rng: np.random.Generator
+    params: Params, scouts: pd.DataFrame, seed: int, replication: int
 ) -> pd.DataFrame:
     """Hours each scout offers each week; freelancers' are pre-drawn here (D-015).
 
-    One row of uniforms per freelancer in scout order, so adding freelancers
-    appends rows and leaves the others' hours unchanged.
+    Each freelancer draws one uniform per week from ``scout_hours.<id>``, so
+    their hours never depend on who else is on the team.
     """
     weeks = sim_week_starts(params)
-    is_fl = (scouts["employment"] == "freelance").to_numpy()
     lo, hi = params.team.freelance_weekly_hours
-    draws = lo + rng.random((int(is_fl.sum()), len(weeks))) * (hi - lo)
-    fl_hours = np.clip(np.round(draws / FREELANCE_HOURS_STEP) * FREELANCE_HOURS_STEP, lo, hi)
     hours = np.full((len(scouts), len(weeks)), FULL_TIME_WEEKLY_HOURS)
-    hours[is_fl] = fl_hours
+    for row, (sid, employment) in enumerate(
+        zip(scouts["scout_id"], scouts["employment"], strict=True)
+    ):
+        if employment == "freelance":
+            draws = lo + scout_stream(seed, "scout_hours", sid, replication).random(len(weeks)) * (
+                hi - lo
+            )
+            step = FREELANCE_HOURS_STEP
+            hours[row] = np.clip(np.round(draws / step) * step, lo, hi)
     return _frame(
         "scout_weekly_hours",
         {
@@ -912,6 +1039,7 @@ def _requests_for_period(
     dur_u = streams[f"durations.{period}"].random((n, 2))
     live_u = streams[f"live_view.{period}"].random(n)
     rework = streams[f"rework.{period}"].random(n)
+    urgent_u = streams[f"urgency.{period}"].random(n)
 
     weights = np.array([SKILL_WEIGHTS[s] for s in SKILL_TYPES], dtype=float)
     cdf = np.cumsum(weights) / weights.sum()
@@ -938,10 +1066,13 @@ def _requests_for_period(
         "client_club": client[keep],
         "player_club": player[keep],
         "skill_type": skills[keep],
-        "needs_live_view": (live_u < d.live_view_share)[keep],
+        # Urgent (express) reports are video-based: never a live view. The
+        # live draw itself is unchanged, so flags stay nested across shares.
+        "needs_live_view": ((live_u < d.live_view_share) & (urgent_u >= d.urgent_share))[keep],
         "desk_hours": (desk_lo + dur_u[:, 0] * (desk_hi - desk_lo))[keep],
         "writeup_hours": (wu_lo + dur_u[:, 1] * (wu_hi - wu_lo))[keep],
         "rework_draw": rework[keep],
+        "urgent": (urgent_u < d.urgent_share)[keep],
     }
 
 
@@ -952,27 +1083,25 @@ def _generate_requests(
 ) -> pd.DataFrame:
     hist_days = _day_range(history_start(params), SIM_START - dt.timedelta(days=1))
     fut_days = _day_range(SIM_START, sim_end(params))
-    hist_rate = daily_rate(params, hist_days)
     parts = {
-        "history": _requests_for_period(
-            params, "history", hist_days, hist_rate, hist_rate, streams
-        ),
-        "future": _requests_for_period(
+        period: _requests_for_period(
             params,
-            "future",
-            fut_days,
-            daily_rate(params, fut_days),
-            daily_rate(params, fut_days, growth=GROWTH_CEILING),
+            period,
+            days,
+            daily_rate(params, days),
+            ceiling_daily_rate(params, days),
             streams,
-        ),
+        )
+        for period, days in (("history", hist_days), ("future", fut_days))
     }
     cols = {k: np.concatenate([p[k] for p in parts.values()]) for k in parts["history"]}
     period = np.repeat(list(parts), [len(p["received"]) for p in parts.values()])
     n = len(period)
 
     received = cols["received"].astype(object).tolist()
-    turnaround = dt.timedelta(days=params.demand.turnaround_days)
-    due = [r + turnaround for r in received]
+    normal = dt.timedelta(days=params.demand.turnaround_days)
+    urgent = dt.timedelta(days=params.demand.urgent_turnaround_days)
+    due = [r + (urgent if u else normal) for r, u in zip(received, cols["urgent"], strict=True)]
     at_risk = [
         bool(live) and next_fixture(by_club, club, *live_view_window(r, dd)) is None
         for live, club, r, dd in zip(
@@ -989,6 +1118,7 @@ def _generate_requests(
             "skill_type": cols["skill_type"],
             "received_date": received,
             "due_date": due,
+            "urgent": cols["urgent"],
             "needs_live_view": cols["needs_live_view"],
             "desk_hours": cols["desk_hours"],
             "writeup_hours": cols["writeup_hours"],
@@ -1001,32 +1131,33 @@ def _generate_requests(
 
 # --- the whole world ----------------------------------------------------------------
 
-_WORLD_STREAMS = ("scouts", "skills", "former_clubs", "leave", "freelance_hours", "fixtures")
 _REQUEST_STREAMS = (
     "arrivals", "thinning", "request_skill", "request_clubs", "durations", "live_view", "rework",
+    "urgency",
 )  # fmt: skip
-STREAM_NAMES: tuple[str, ...] = _WORLD_STREAMS + tuple(
+STREAM_NAMES: tuple[str, ...] = ("fixtures",) + tuple(
     f"{name}.{period}" for name in _REQUEST_STREAMS for period in ("history", "future")
 )
 
 
-# Streams that define the *shape* of the world: the team and the fixture
-# calendar. They always come from replication 0. Everything else is luck.
-FIXED_STREAMS: tuple[str, ...] = ("scouts", "skills", "former_clubs", "fixtures")
+# Shared streams that define the *shape* of the world: the fixture calendar.
+# They always come from replication 0. (The team's shape lives in per-scout
+# streams, see ``scout_stream``.) Everything else is luck.
+FIXED_STREAMS: tuple[str, ...] = ("fixtures",)
 
 
 def world_streams(
     seed: int, names: Sequence[str] = STREAM_NAMES, replication: int = 0
 ) -> dict[str, np.random.Generator]:
-    """The named streams of one world: fixed ones from replication 0, the rest from ``replication``.
+    """The shared named streams of one world: fixed ones from replication 0, the rest
+    from ``replication``.
 
     A replication (``sim.seeds``) varies *luck*, not *decisions* or the team:
     the scouts and the fixture calendar are the same in every replication,
-    while arrivals, durations, live-view flags, rework draws, freelancer hours
-    and leave are drawn again from the replication's own streams
-    (``rng.make_streams(seed, names, replication=k)``). Replication 0 is the
-    world written to ``raw/``; it is identical to a world built before
-    replications existed.
+    while arrivals, durations, live-view flags, urgency, rework draws,
+    freelancer hours and leave are drawn again from the replication's own
+    streams (``rng.make_streams(seed, names, replication=k)``; per-scout luck
+    via ``scout_stream``). Replication 0 is the world written to ``raw/``.
     """
     fixed = [n for n in names if n in FIXED_STREAMS]
     luck = [n for n in names if n not in FIXED_STREAMS]
@@ -1040,15 +1171,14 @@ def generate_world(params: Params, *, seed: int | None = None, replication: int 
     team and fixtures of replication 0 and redraws the luck (see
     :func:`world_streams`).
     """
-    streams = world_streams(
-        params.sim.seed if seed is None else seed, STREAM_NAMES, replication=replication
-    )
-    scouts = _generate_scouts(params, streams)
+    seed = params.sim.seed if seed is None else seed
+    streams = world_streams(seed, STREAM_NAMES, replication=replication)
+    scouts = _generate_scouts(params, seed)
     fixtures = _generate_fixtures(params, streams["fixtures"])
     return World(
         scouts=scouts,
-        scout_unavailability=_generate_unavailability(params, scouts, streams["leave"]),
-        scout_weekly_hours=_generate_weekly_hours(params, scouts, streams["freelance_hours"]),
+        scout_unavailability=_generate_unavailability(params, scouts, seed, replication),
+        scout_weekly_hours=_generate_weekly_hours(params, scouts, seed, replication),
         fixtures=fixtures,
         requests=_generate_requests(
             params, streams, fixtures_by_club(fixtures_from_frame(fixtures))
@@ -1084,15 +1214,19 @@ def requests_from_frame(df: pd.DataFrame) -> list[Request]:
 # --- summaries used by the CLI and tests (pure) ---------------------------------------
 
 
-def realised_start_load(world: World, params: Params, months: int = 1) -> float:
+def realised_start_load(
+    world: World, params: Params, months: int = 1, *, deseasonalised: bool = True
+) -> float:
     """Realised load of the run's own initial team over the first ``months`` months.
 
-    Work hours of the requests received in that span, deseasonalised and
-    de-trended back to the ``SIM_START`` run-rate (divided by the mean
-    seasonality x growth multiplier of the span), over the run's team
-    available hours. For the reference team this is ``start_load`` in
-    expectation; a bigger team gives a lower load. The rest is the Poisson and
-    duration noise of this particular draw.
+    Work hours of the requests received in that span over the run's team
+    available hours. With ``deseasonalised`` (default) the work is first
+    brought back to the ``SIM_START`` run-rate (divided by the mean seasonality
+    x growth multiplier of the span): for the reference team that is
+    ``start_load`` in expectation, and a bigger team gives a lower load. With
+    ``deseasonalised=False`` it is the raw calendar load, e.g. January's peak
+    (compare :func:`month0_peak_load`). The rest is the Poisson and duration
+    noise of this particular draw.
     """
     req = world.requests
     end = add_months(SIM_START, months)
@@ -1103,10 +1237,26 @@ def realised_start_load(world: World, params: Params, months: int = 1) -> float:
         + span["needs_live_view"].sum() * params.demand.live_view_hours
     )
     days = _day_range(SIM_START, end - dt.timedelta(days=1))
-    # Sum of the multiplier = "days at the SIM_START run-rate" the span is worth.
-    month_equivalents = _demand_multiplier(params, days).sum() * 12 / DAYS_PER_YEAR
-    capacity = team_available_hours_per_month(params) * month_equivalents
+    # Deseasonalised: the multiplier sum = "days at the SIM_START run-rate" the
+    # span is worth. Raw: plain calendar days.
+    day_weight = _demand_multiplier(params, days).sum() if deseasonalised else len(days)
+    capacity = team_available_hours_per_month(params) * day_weight * 12 / DAYS_PER_YEAR
     return float(realised / capacity) if capacity > 0 else float("nan")
+
+
+def month0_peak_load(params: Params) -> float:
+    """Expected load of the run's initial team in month 0 (January), seasonality included.
+
+    ``start_load`` is defined on the deseasonalised, average-month run-rate;
+    January is a transfer-window peak, so the team is busier than that in
+    practice (about 0.70 x 1.35 x the January growth, ~1.0, by default).
+    Expected work = the month's arrivals x the run's hours per request;
+    capacity = the run's team hours for that many calendar days.
+    """
+    days = _day_range(SIM_START, add_months(SIM_START, 1) - dt.timedelta(days=1))
+    work = daily_rate(params, days).sum() * expected_hours_per_request(params)
+    capacity = team_available_hours_per_month(params) * len(days) * 12 / DAYS_PER_YEAR
+    return float(work / capacity) if capacity > 0 else float("nan")
 
 
 def at_risk_share(world: World, period: str = "future") -> float:

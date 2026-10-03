@@ -129,6 +129,17 @@ def parameters_section(params: Params | None, run_id: str, seeds_table: bool = F
     with st.expander("Full params.yaml"):
         st.code(params_to_yaml(params), language="yaml")
     if seeds_table:
+        summary = ui.run_summary(run_id).value
+        with st.expander("Solver diagnostics"):
+            diag = ui.diagnostics_table(summary.diagnostics if summary else {})
+            if diag.empty:
+                st.caption("This run recorded no solver diagnostics.")
+            else:
+                st.caption(
+                    "How the assignment rounds went, totalled over repeats. Time-limit stops "
+                    "and fallbacks mean the optimiser didn't plan those rounds itself."
+                )
+                st.dataframe(diag, hide_index=True)
         seeds = ui.run_table(run_id, "seeds")
         with st.expander("Per-repeat results"):
             if seeds.value is None:
@@ -161,30 +172,28 @@ def done_body(status: runs.RunStatus, params: Params | None) -> None:
     st.subheader(ui.run_takeaway(summary, params))
     seeds = tables["seeds"].value
     ui.kpi_row(summary, params, seeds_late_reports(seeds) if seeds is not None else None)
+    if warning := ui.diagnostics_warning(summary.diagnostics):
+        st.warning(warning, icon=":material/warning:")
     chart(charts.fig_cost_split({status.name: summary.cost_parts()}, mode="share"))
 
     service, team, demand, parameters = st.tabs(
         ["Service", "Team & cost", "Demand & hiring plan", "Parameters"]
     )
     with service:
-        weekly, outcomes, raw = (
-            tables["weekly"].value,
-            tables["outcomes"].value,
-            tables["raw_requests"].value,
-        )
+        weekly, outcomes = tables["weekly"].value, tables["outcomes"].value
         if weekly is not None:
             chart(charts.fig_backlog({"run": weekly}, {"run": policy}))
         else:
             _missing("weekly")
-        if outcomes is not None and raw is not None:
-            monthly = monthly_on_time(outcomes, raw)
+        if outcomes is not None:
+            monthly = monthly_on_time(outcomes)
             chart(
                 charts.fig_on_time_by_month(
                     {"run": monthly}, {"run": policy}, params.sim.target_on_time
                 )
             )
         else:
-            _missing("outcomes" if outcomes is None else "raw_requests")
+            _missing("outcomes")
         if outcomes is not None:
             chart(
                 charts.fig_turnaround_hist(
@@ -192,6 +201,9 @@ def done_body(status: runs.RunStatus, params: Params | None) -> None:
                     policy,
                     promise_days=params.demand.turnaround_days,
                     p90=summary.mean("p90_turnaround_days"),
+                    urgent_days=(
+                        params.demand.urgent_turnaround_days if params.demand.urgent_share else None
+                    ),
                 )
             )
         at_risk, n_req = summary.mean("n_at_risk_day_one"), summary.mean("n_requests")
@@ -199,6 +211,12 @@ def done_body(status: runs.RunStatus, params: Params | None) -> None:
             st.caption(
                 f"{fmt_count(at_risk)} requests ({fmt_pct(at_risk / n_req)}) were at risk from day "
                 "one: no suitable match before their due date. They count in the on-time rate."
+            )
+        censored = summary.mean("n_censored")
+        if censored:
+            st.caption(
+                f"{fmt_count(censored)} requests arrived too late in the year to be due before "
+                "it ends, so they are not scored either way (their outcome is unknown)."
             )
     with team:
         weekly, hiring = tables["weekly"].value, tables["hiring_plan"].value
@@ -227,7 +245,7 @@ def done_body(status: runs.RunStatus, params: Params | None) -> None:
         if raw is not None and forecast is not None:
             chart(
                 charts.fig_demand_vs_forecast(
-                    monthly_demand(raw),
+                    monthly_demand(raw, tables["outcomes"].value),
                     forecast_totals(forecast),
                     policy=policy,
                     quantile=params.capacity_plan.quantile,

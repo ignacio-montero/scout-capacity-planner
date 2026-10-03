@@ -101,6 +101,7 @@ def test_param_ui_covers_exactly_the_basic_parameters() -> None:
     basic = {
         "team.full_time_count", "team.freelance_count", "team.follow_hiring_plan",
         "demand.start_load", "demand.actual_growth", "demand.live_view_share",
+        "demand.urgent_share",
         "capacity_plan.assumed_growth", "capacity_plan.quantile",
         "capacity_plan.target_utilisation", "automation.enabled", "automation.desk_reduction",
         "automation.rework_rate", "automation.monthly_cost", "assignment.policy",
@@ -220,6 +221,10 @@ def test_describe_params_four_sentences() -> None:
     sentences = vm.describe_params(DEFAULTS)
     assert len(sentences) == 4
     assert "**4x**" in sentences[0] and "**70%**" in sentences[0]
+    assert "**15%** of requests are urgent (7-day promise)" in sentences[0]
+    assert "January" not in sentences[0]  # only with the peak figure
+    with_peak = vm.describe_params(DEFAULTS, january_load=1.0)
+    assert "about **100%** in January, the transfer window" in with_peak[0]
     assert "cautiously (P80)" in sentences[1]
     assert "**24 full-time scouts and 16 freelancers**" in sentences[2]
     assert "**1,000**" in sentences[3]
@@ -401,3 +406,33 @@ def test_queue_sentence() -> None:
 
 def test_params_type_is_unchanged() -> None:
     assert isinstance(vm.draft_from_params(Params()), dict)
+
+
+def test_diagnostics_table_and_warning() -> None:
+    quiet = {"assignment_runs": 365, "optimiser_solves": 365, "wall_clock_hits": 0,
+             "fallbacks": 0, "mean_solve_seconds": 0.2, "max_solve_seconds": 1.0,
+             "per_seed": [{"seed": 1}], "something_new": 5}  # fmt: skip
+    table = vm.diagnostics_table(quiet)
+    assert table["What"].tolist()[:2] == ["Assignment rounds", "Optimiser solves"]
+    assert "something_new" not in table.to_string()  # unknown keys skipped, never fatal
+    assert vm.diagnostics_warning(quiet) is None
+    noisy = {**quiet, "wall_clock_hits": 3, "fallbacks": 1}
+    warning = vm.diagnostics_warning(noisy)
+    assert "time limit 3 times" in warning and "earliest deadline first 1 time" in warning
+    assert vm.diagnostics_warning({}) is None
+
+
+def test_start_load_help_mentions_the_january_peak() -> None:
+    text = vm.PARAM_UI["demand.start_load"].help
+    assert "average month" in text and "January" in text and "1.35x" in text
+
+
+def test_unknown_advanced_keys_flow_through(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A parameter added to config.py later and not in PARAM_UI is just "advanced":
+    # it gets a dotted label, its own group heading, and shows up in diffs.
+    assert vm.setting_label("demand.some_new_setting") == "demand.some_new_setting"
+    assert vm.setting_group("demand.some_new_setting").startswith("Advanced › Demand")
+    assert vm.fmt_value("demand.some_new_setting", 0.25) == "0.25"
+    edited = apply_overrides(DEFAULTS, {"assignment.horizon_days": 5})
+    diff = vm.param_diff([DEFAULTS, edited])
+    assert diff["Setting"].tolist() == ["assignment.horizon_days"]

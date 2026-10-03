@@ -121,6 +121,10 @@ class Request:
     runs with different rework rates therefore fail on nested sets of requests
     instead of on unrelated ones (common random numbers, D-015). The default
     1.0 means "never fails", convenient for hand-built requests in tests.
+
+    ``urgent`` marks a request promised on the shorter, urgent turnaround; its
+    ``due_date`` already reflects that, so nothing else needs to read the flag
+    to be correct (it is there for metrics and display).
     """
 
     request_id: str
@@ -134,6 +138,7 @@ class Request:
     writeup_hours: float
     period: Period = "future"
     rework_draw: float = 1.0
+    urgent: bool = False
 
     def __post_init__(self) -> None:
         _check_literal(self.period, Period, "period")

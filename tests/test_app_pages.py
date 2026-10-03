@@ -231,10 +231,15 @@ def test_new_run_from_published_sweep_row(demo_env) -> None:
 def test_app_code_never_imports_the_simulation() -> None:
     """D-013: the app only queues runs; no simulation stage may be imported by app code."""
     banned = {"generate", "forecast", "plan", "simulate", "pipeline", "assign", "worker"}
+    # Explicit exception: a closed-form calibration formula (microseconds, no world is
+    # generated), used for the "about N% in January" note on New run.
+    allowed = {("scout_planner.generate", "month0_peak_load")}
     for path in MAIN.parent.rglob("*.py"):
         tree = ast.parse(path.read_text(encoding="utf-8"))
         for node in ast.walk(tree):
             if isinstance(node, ast.ImportFrom) and node.module:
+                if all((node.module, a.name) in allowed for a in node.names):
+                    continue
                 names = {node.module.split(".")[-1]} | {a.name for a in node.names}
                 if node.module.startswith("scout_planner"):
                     assert not names & banned, f"{path.name} imports {names & banned}"
@@ -243,3 +248,37 @@ def test_app_code_never_imports_the_simulation() -> None:
                     assert alias.name.split(".")[-1] not in banned or not alias.name.startswith(
                         "scout_planner"
                     ), f"{path.name} imports {alias.name}"
+
+
+# --- a real run from the M4 pipeline (contract test between the engine and the UI) -------
+
+
+@pytest.fixture(scope="module")
+def real_root(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """One real run: EDF, one repeat (a few seconds), executed like the worker does."""
+    from scout_planner.config import apply_overrides, load_default_params
+    from scout_planner.pipeline import run_pipeline
+
+    root = tmp_path_factory.mktemp("real") / "runs"
+    params = apply_overrides(load_default_params(), {"assignment.policy": "edf", "sim.seeds": 1})
+    run_id = runs.create_run(params, "Real: EDF one repeat", root=root)
+    runs.update_status(run_id, root=root, state="running")
+    run_pipeline(params, runs.run_dir(run_id, root), lambda *_: None, lambda: False, max_workers=1)
+    runs.update_status(run_id, root=root, state="done")
+    return root
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("page", PAGES)
+def test_pages_render_a_real_run(
+    real_root: Path, monkeypatch: pytest.MonkeyPatch, page: str
+) -> None:
+    monkeypatch.setenv("SCOUT_RUNS_ROOT", str(real_root))
+    monkeypatch.setenv("SCOUT_PUBLISHED_DIR", str(real_root.parent / "published"))
+    at = open_page(page)
+    no_exception(at)
+    assert not at.error, [e.value for e in at.error]
+    if page == "pages/run_detail.py":
+        assert at.subheader[0].value.startswith("On time ")
+        assert not any("Couldn't load" in w.value for w in at.warning)  # every file matched
+        assert len(at.get("plotly_chart")) >= 8

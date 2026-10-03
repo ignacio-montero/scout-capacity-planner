@@ -4,6 +4,10 @@
 [theme]
 primaryColor = "#237A4B"
 
-# Local-only tool: listen on this machine only, never on the LAN.
+# Local tool: listen on this machine only, never on the LAN or public Wi-Fi.
 [server]
 address = "localhost"
+
+# Hide the developer toolbar items (including "Deploy"): this app is not deployed.
+[client]
+toolbarMode = "minimal"

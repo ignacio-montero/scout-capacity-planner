@@ -103,9 +103,22 @@ class DemandParams(_StrictModel):
     # simulated year itself follows ``actual_growth`` instead (D-014).
     history_growth_per_year: float = Field(0.15, ge=-0.5, le=1.0)
     turnaround_days: int = Field(14, ge=7, le=28)
+    # Urgent requests get a shorter promise; mixed deadlines are what make
+    # earliest-due-first differ from first-come-first-served.
+    urgent_share: float = Field(0.15, ge=0.0, le=1.0)
+    urgent_turnaround_days: int = Field(7, ge=3, le=28)
     desk_hours: TaskHoursRange = (4.0, 10.0)
     writeup_hours: TaskHoursRange = (2.0, 4.0)
     live_view_hours: float = Field(8.0, gt=0, le=24)
+
+    @model_validator(mode="after")
+    def _urgent_is_not_slower(self) -> DemandParams:
+        if self.urgent_turnaround_days > self.turnaround_days:
+            raise ValueError(
+                f"urgent_turnaround_days ({self.urgent_turnaround_days}) must be <= "
+                f"turnaround_days ({self.turnaround_days})"
+            )
+        return self
 
 
 class CapacityPlanParams(_StrictModel):
@@ -149,6 +162,10 @@ class AssignmentParams(_StrictModel):
     horizon_days: int = Field(7, ge=1, le=14)
     weights: AssignmentWeights = AssignmentWeights()
     time_limit_s: float = Field(1.0, ge=0.1, le=10.0)
+    # Optimiser only (advanced): what a freelance hour costs in the objective.
+    # "full" = the hourly rate; "premium" = rate - salaried hourly equivalent
+    # (the work must be done by someone; deferring only saves the premium).
+    cost_basis: Literal["full", "premium"] = "full"
 
 
 class CostParams(_StrictModel):

@@ -85,7 +85,13 @@ from statsmodels.tsa.exponential_smoothing.ets import ETSModel
 
 from scout_planner import generate
 from scout_planner.config import Params, apply_overrides
-from scout_planner.generate import SIM_START, SKILL_TYPES, World, add_months
+from scout_planner.generate import (
+    SIM_START,
+    SKILL_TYPES,
+    World,
+    add_months,
+    effective_live_view_share,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -154,12 +160,13 @@ def automation_factor(params: Params) -> float:
 def hours_per_request(params: Params) -> float:
     """Expected scout hours per request under the run's demand shape and automation.
 
-    ``E[desk] x automation_factor + live_view_share x live_view_hours + E[write-up]``.
+    ``E[desk] x automation_factor + live share x live_view_hours + E[write-up]``,
+    with the effective live share (urgent requests never need a live view).
     """
     d = params.demand
     return (
         float(np.mean(d.desk_hours)) * automation_factor(params)
-        + d.live_view_share * d.live_view_hours
+        + effective_live_view_share(params) * d.live_view_hours
         + float(np.mean(d.writeup_hours))
     )
 
@@ -175,7 +182,8 @@ def hours_per_request_variance(params: Params) -> float:
     The three parts are independent. Desk ~ uniform; with automation it is
     ``D (1 - reduction)`` with probability ``1 - rework``, else ``D + overhead``
     (a two-point mixture). Live view = ``live_view_hours`` with probability
-    ``live_view_share`` (Bernoulli). Write-up ~ uniform.
+    the effective live share (Bernoulli; urgent requests never need one).
+    Write-up ~ uniform.
     """
     d, a = params.demand, params.automation
     m1, m2 = _uniform_moments(*d.desk_hours)
@@ -186,7 +194,7 @@ def hours_per_request_variance(params: Params) -> float:
     else:
         e1, e2 = m1, m2
     w1, w2 = _uniform_moments(*d.writeup_hours)
-    share = d.live_view_share
+    share = effective_live_view_share(params)
     return (e2 - e1**2) + share * (1 - share) * d.live_view_hours**2 + (w2 - w1**2)
 
 

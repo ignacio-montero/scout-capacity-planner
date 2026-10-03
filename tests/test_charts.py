@@ -95,7 +95,7 @@ def test_backlog_overlay_uses_policy_colour_and_slot_dash(demo) -> None:
 
 def test_on_time_by_month_has_target_line(demo) -> None:
     t = demo["tables"]["defaults"]
-    monthly = monthly_on_time(t["outcomes"], t["raw_requests"])
+    monthly = monthly_on_time(t["outcomes"])
     fig = charts.fig_on_time_by_month({"run": monthly}, {"run": "optimiser"}, 0.95)
     assert any(s.y0 == 0.95 for s in fig.layout.shapes)
     assert any(a.text == "95% target" for a in fig.layout.annotations)
@@ -166,7 +166,9 @@ def test_utilisation_bars_with_error_bars() -> None:
 def test_demand_vs_forecast(demo) -> None:
     t = demo["tables"]["defaults"]
     fig = charts.fig_demand_vs_forecast(
-        monthly_demand(t["raw_requests"]), forecast_totals(t["forecast"]), quantile=0.8
+        monthly_demand(t["raw_requests"], t["outcomes"]),
+        forecast_totals(t["forecast"]),
+        quantile=0.8,
     )
     names = [tr.name for tr in fig.data]
     assert names == ["Actual", "Forecast (P50)", "Planning forecast (P80)"]
@@ -193,7 +195,7 @@ def test_capacity_heatmap_is_diverging_and_sorted(demo) -> None:
     assert heat.colorscale[0][1] == "#0072B2" and heat.colorscale[-1][1] == "#D55E00"
     short = plan.assign(s=plan["gap_hours"].clip(lower=0)).groupby("skill_type")["s"].sum()
     assert heat.y[-1] == short.idxmax()  # worst skill drawn on top
-    assert title(fig).startswith(("Shortfalls concentrate", "No skill"))
+    assert title(fig).startswith(("Before hiring, shortfalls concentrate", "No skill"))
 
 
 def test_sweep_scatter_single_growth(demo) -> None:
@@ -243,3 +245,42 @@ def test_readme_mode_is_white_and_sized(demo) -> None:
 def test_charts_module_has_no_streamlit_import() -> None:
     source = Path(charts.__file__).read_text(encoding="utf-8")
     assert "import streamlit" not in source
+
+
+def test_demand_band_when_repeats_differ() -> None:
+    months = pd.to_datetime(["2026-12-01", "2027-01-01", "2027-02-01"])
+    actual = pd.DataFrame(
+        {
+            "month": months,
+            "requests": [100.0, 140.0, 120.0],
+            "requests_min": [100.0, 130.0, 115.0],
+            "requests_max": [100.0, 150.0, 125.0],
+            "period": ["history", "future", "future"],
+        }
+    )
+    forecast = pd.DataFrame(
+        {"month": months[1:], "requests_p50": [130.0, 120.0], "requests_pq": [140.0, 130.0]}
+    )
+    fig = charts.fig_demand_vs_forecast(actual, forecast)
+    band = [t for t in fig.data if t.fill == "toself"]
+    assert len(band) == 1 and len(band[0].x) == 4  # plan-year months only, there and back
+
+
+def test_long_titles_wrap_instead_of_clipping() -> None:
+    long = (
+        "Cheapest way to stay on time at 4x: Earliest deadline first, pre-screen on, 3,436k a year"
+    )
+    fig = charts.style_figure(go.Figure(), long, "One dot per run · 6 runs · mean of 3 repeats")
+    first_part = fig.layout.title.text.split("<span")[0]
+    lines = [line for line in first_part.split("<br>") if line]
+    assert len(lines) >= 2 and all(len(line) <= charts.TITLE_WRAP for line in lines)
+    assert fig.layout.margin.t >= 40 + 24 * len(lines)
+
+
+def test_turnaround_hist_ignores_censored_requests() -> None:
+    outcomes = pd.DataFrame(
+        {"seed": [1, 1, 1], "turnaround_days": [5.0, 30.0, float("nan")],
+         "scored": [True, False, True]}
+    )  # fmt: skip
+    fig = charts.fig_turnaround_hist(outcomes, "edf")
+    assert list(fig.data[0].x) == [5.0]

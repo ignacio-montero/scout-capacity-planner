@@ -196,8 +196,9 @@ def _capacity_and_hiring(
                     available += count * per
                     hire_rows.append(
                         {
-                            "month_to_act": _month_start(m - lead),
-                            "joins_month": month,
+                            # month indices (0 = first plan month), as the pipeline writes
+                            "month_to_act": m - lead,
+                            "joins_month": m,
                             "skill_type": skill,
                             "hire_type": kind,
                             "count": count,
@@ -235,8 +236,7 @@ def _team_by_month(
     fl = np.full(months, float(params.team.freelance_count))
     if params.team.follow_hiring_plan:
         for _, hire in hiring.iterrows():
-            joins = hire["joins_month"]
-            m = (joins.year - generate.SIM_START.year) * 12 + joins.month - 1
+            m = int(hire["joins_month"])
             target = ft if hire["hire_type"] == "full_time" else fl
             target[m:] += hire["count"]
     return ft, fl
@@ -245,6 +245,7 @@ def _team_by_month(
 def simulate_demo(params: Params, world: generate.World) -> DemoOutputs:
     """The toy model: forecast -> plan -> outcomes per seed -> aggregates."""
     months = params.sim.months
+    end = pd.Timestamp(generate.sim_end(params))
     rng = np.random.default_rng(params.sim.seed)
     forecast = _forecast(world, params, months)
     backtest = _backtest(world, rng)
@@ -286,18 +287,32 @@ def simulate_demo(params: Params, world: generate.World) -> DemoOutputs:
             np.minimum(np.round(td + late_days), 75),
         ).astype(float)
         completed = received + pd.to_timedelta(turnaround, unit="D")
-        on_time = (completed <= due).to_numpy()
+        # Censoring, as in the real metrics: scored iff due by the last simulated
+        # day; work not finished by then has no completion date (and is late).
+        unfinished = (completed > end).to_numpy()
+        completed = completed.mask(unfinished)
+        turnaround = np.where(unfinished, np.nan, turnaround)
+        on_time = ((completed <= due) & ~pd.Series(unfinished)).to_numpy()
+        scored = (due <= end).to_numpy()
+        # Each repeat simulates its own requests: give repeats 2+ their own ids
+        # so any accidental join to raw/ by request_id fails loudly in tests.
+        ids = req["request_id"].astype(str) + ("" if k == 0 else f"-r{k + 1}")
         outcome_frames.append(
             pd.DataFrame(
                 {
                     "seed": seed,
-                    "request_id": req["request_id"].astype(str),
+                    "request_id": ids,
                     "completed_date": completed.dt.date,
                     "turnaround_days": turnaround,
                     "on_time": on_time,
                     "at_risk_day_one": at_risk,
                     "scouts_involved": np.where(req["needs_live_view"].to_numpy(), 2, 1)
                     + (srng.random(len(req)) < 0.1),
+                    "scored": scored,
+                    "received_date": received.dt.date,
+                    "due_date": due.dt.date,
+                    "skill_type": req["skill_type"].astype(str),
+                    "needs_live_view": req["needs_live_view"].to_numpy(),
                 }
             )
         )
@@ -308,7 +323,7 @@ def simulate_demo(params: Params, world: generate.World) -> DemoOutputs:
             completed.to_numpy()[None, :],
             due.to_numpy()[None, :],
         )
-        open_mask = (rec <= ws) & (comp > ws)
+        open_mask = (rec <= ws) & ~(comp <= ws)  # unfinished (NaT) stays open
         ws_month = np.clip(_month_index(week_starts), 0, months - 1)
         weekly_frames.append(
             pd.DataFrame(
@@ -327,7 +342,8 @@ def simulate_demo(params: Params, world: generate.World) -> DemoOutputs:
             np.clip(np.mean(np.minimum(load, 1.05)) * 0.92 + srng.normal(0, 0.01), 0.3, 0.97)
         )
         util_fl = float(np.clip(util_ft - 0.1 + srng.normal(0, 0.01), 0.2, 0.95))
-        n_late = int((~on_time).sum())
+        n_late = int((scored & ~on_time).sum())
+        done_scored = turnaround[scored & ~unfinished]
         salaried = float(ft.sum() * params.cost.full_time_monthly_salary)
         freelance = float(
             fl.sum() * FREELANCE_MONTHLY_HOURS * util_fl * params.cost.freelance_hourly_rate
@@ -338,11 +354,11 @@ def simulate_demo(params: Params, world: generate.World) -> DemoOutputs:
         seeds_rows.append(
             {
                 "seed": seed,
-                "n_requests": len(req),
-                "n_at_risk_day_one": int(at_risk.sum()),
-                "on_time_rate": float(on_time.mean()),
-                "mean_turnaround_days": float(turnaround.mean()),
-                "p90_turnaround_days": float(np.quantile(turnaround, 0.9)),
+                "n_requests": int(scored.sum()),
+                "n_at_risk_day_one": int((at_risk & scored).sum()),
+                "on_time_rate": float(on_time[scored].mean()),
+                "mean_turnaround_days": float(done_scored.mean()),
+                "p90_turnaround_days": float(np.quantile(done_scored, 0.9)),
                 "util_full_time": util_ft,
                 "util_freelance": util_fl,
                 "cost_salaried": salaried,
@@ -356,6 +372,8 @@ def simulate_demo(params: Params, world: generate.World) -> DemoOutputs:
                 "n_hires_freelance": int(
                     hires.loc[hires["hire_type"] == "freelance", "count"].sum()
                 ),
+                "n_late": n_late,
+                "n_censored": int((~scored).sum()),
             }
         )
     seeds = pd.DataFrame(seeds_rows)
@@ -364,12 +382,27 @@ def simulate_demo(params: Params, world: generate.World) -> DemoOutputs:
         name: {"mean": s.mean, "min": s.min, "max": s.max} for name, s in summary.metrics.items()
     }
     summary_json["meets_target"] = summary.meets_target
+    summary_json["n_seeds"] = params.sim.seeds
+    optimiser = params.assignment.policy == "optimiser"
+    rounds = 365 if params.assignment.cadence == "daily" else 52
+    summary_json["diagnostics"] = {
+        "assignment_runs": rounds * params.sim.seeds,
+        "optimiser_solves": rounds * params.sim.seeds if optimiser else 0,
+        # toy: the pre-screen run shows what the time-limit warning looks like
+        "wall_clock_hits": 3 if optimiser and params.automation.enabled else 0,
+        "fallbacks": 0,
+        "mean_solve_seconds": 0.21 if optimiser else 0.0,
+        "max_solve_seconds": 1.0 if optimiser else 0.0,
+        "live_view_retargets": 60 * params.sim.seeds,
+        "reworks": 0,
+        "per_seed": [],
+    }
     return DemoOutputs(
         forecast=forecast,
         backtest=backtest,
         capacity_plan=capacity_plan,
         hiring_plan=hiring,
-        seeds=seeds[["seed", *SUMMARY_METRICS]],
+        seeds=seeds[["seed", *SUMMARY_METRICS]],  # contract columns + n_censored
         weekly=pd.concat(weekly_frames, ignore_index=True),
         outcomes=pd.concat(outcome_frames, ignore_index=True),
         summary=summary_json,
@@ -600,7 +633,7 @@ def write_demo_published(published_dir: Path, name: str = "headline") -> Path:
                 out = simulate_demo(params, generate.generate_world(params))
                 flat: dict[str, Any] = {}
                 for metric, stat in out.summary.items():
-                    if metric == "meets_target":
+                    if metric in ("meets_target", "n_seeds", "diagnostics"):
                         continue
                     for bound in ("mean", "min", "max"):
                         flat[f"{metric}_{bound}"] = stat[bound]

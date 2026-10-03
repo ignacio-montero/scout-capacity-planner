@@ -20,6 +20,7 @@ import ui
 from scout_planner import runs
 from scout_planner.config import Params, params_to_yaml
 from scout_planner.formatting import fmt_growth, fmt_when
+from scout_planner.generate import month0_peak_load  # allow-listed in test_app_pages
 from scout_planner.results import (
     list_published,
     load_published,
@@ -279,13 +280,21 @@ def duplicate_of(params: Params) -> runs.RunStatus | None:
     return None
 
 
+def january_load(params: Params) -> float | None:
+    """Expected January load (closed-form calibration formula, microseconds; no simulation)."""
+    try:
+        return month0_peak_load(params)
+    except Exception:  # an odd parameter set: just leave the clause out
+        return None
+
+
 def render_review(check: ui.DraftCheck) -> None:
     source = st.session_state.get(SOURCE)
     defaults = ui.defaults()
     with st.container(border=True):
         st.subheader("What you are about to simulate")
         if check.params is not None:
-            for sentence in ui.describe_params(check.params):
+            for sentence in ui.describe_params(check.params, january_load(check.params)):
                 st.markdown(sentence)
             reference, ref_label = (
                 (source[1], f"from '{source[0]}'") if source else (defaults, "from defaults")

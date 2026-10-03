@@ -37,6 +37,7 @@ from scout_planner.config import Params, apply_overrides
 
 __all__ = [
     "COST_METRICS",
+    "SEED_METRICS",
     "SUMMARY_METRICS",
     "TABLES",
     "Loaded",
@@ -54,14 +55,14 @@ __all__ = [
     "monthly_on_time",
     "normalise_sweep_frame",
     "params_for_sweep_row",
+    "scored_outcomes",
     "summary_from_seeds",
 ]
 
 # --- contract constants ----------------------------------------------------------
 
-# seeds.parquet columns (DATA_CONTRACTS.md section 5), minus "seed". summary.json
-# holds each of these as {mean, min, max}.
-SUMMARY_METRICS: tuple[str, ...] = (
+# seeds.parquet contract columns (DATA_CONTRACTS.md section 5), minus "seed".
+SEED_METRICS: tuple[str, ...] = (
     "n_requests",
     "n_at_risk_day_one",
     "on_time_rate",
@@ -76,7 +77,13 @@ SUMMARY_METRICS: tuple[str, ...] = (
     "cost_total",
     "n_hires_full_time",
     "n_hires_freelance",
+    "n_late",
 )
+# summary.json holds each of these as {mean, min, max}; n_censored = arrived but
+# due after the last simulated day, so not scored (right-censored).
+SUMMARY_METRICS: tuple[str, ...] = (*SEED_METRICS, "n_censored")
+# summary.json keys that are not metrics.
+SUMMARY_EXTRAS = frozenset({"meets_target", "n_seeds", "diagnostics"})
 COST_METRICS: tuple[str, ...] = (
     "cost_salaried",
     "cost_freelance",
@@ -95,7 +102,7 @@ class TableSpec:
 
 
 TABLES: dict[str, TableSpec] = {
-    "seeds": TableSpec("results/seeds.parquet", ("seed", *SUMMARY_METRICS)),
+    "seeds": TableSpec("results/seeds.parquet", ("seed", *SEED_METRICS)),
     "weekly": TableSpec(
         "results/weekly.parquet",
         (
@@ -119,8 +126,15 @@ TABLES: dict[str, TableSpec] = {
             "on_time",
             "at_risk_day_one",
             "scouts_involved",
+            # Each repeat simulates its own requests, so the attributes the
+            # charts need travel with the outcome (no join to raw/).
+            "scored",
+            "received_date",
+            "due_date",
+            "skill_type",
+            "needs_live_view",
         ),
-        ("completed_date",),
+        ("completed_date", "received_date", "due_date"),
     ),
     "forecast": TableSpec(
         "forecast.parquet",
@@ -196,6 +210,8 @@ class Summary:
 
     metrics: Mapping[str, MetricStat] = field(default_factory=dict)
     meets_target: bool | None = None
+    n_seeds: int | None = None
+    diagnostics: Mapping[str, Any] = field(default_factory=dict)
 
     def stat(self, name: str) -> MetricStat | None:
         return self.metrics.get(name)
@@ -205,12 +221,13 @@ class Summary:
         return None if stat is None else stat.mean
 
     def late_reports(self) -> float | None:
-        """Mean late reports per repeat, approximated from the means.
+        """Mean late reports per repeat: the exact ``n_late`` when the run has it.
 
-        Exact per repeat is ``n_requests * (1 - on_time_rate)``; the mean of a
-        product is close to the product of means here. (A ``n_late`` column in
-        ``seeds.parquet`` would make this exact; proposed in the M5 report.)
+        Older summaries without ``n_late`` fall back to
+        ``n_requests * (1 - on_time_rate)`` from the means (close, not exact).
         """
+        if (late := self.mean("n_late")) is not None:
+            return late
         n, rate = self.mean("n_requests"), self.mean("on_time_rate")
         if n is None or rate is None:
             return None
@@ -243,7 +260,7 @@ def parse_summary(data: Any) -> Loaded[Summary]:
         return Loaded(None, "summary.json is not a JSON object")
     metrics: dict[str, MetricStat] = {}
     for name, entry in data.items():
-        if name == "meets_target":
+        if name in SUMMARY_EXTRAS:
             continue
         if isinstance(entry, Mapping):
             values = [_as_float(entry.get(k)) for k in ("mean", "min", "max")]
@@ -256,7 +273,16 @@ def parse_summary(data: Any) -> Loaded[Summary]:
     if "on_time_rate" not in metrics:
         return Loaded(None, "summary.json has no on_time_rate")
     verdict = data.get("meets_target")
-    return Loaded(Summary(metrics, verdict if isinstance(verdict, bool) else None))
+    n_seeds = data.get("n_seeds")
+    diagnostics = data.get("diagnostics")
+    return Loaded(
+        Summary(
+            metrics,
+            verdict if isinstance(verdict, bool) else None,
+            n_seeds if isinstance(n_seeds, int) and not isinstance(n_seeds, bool) else None,
+            dict(diagnostics) if isinstance(diagnostics, Mapping) else {},
+        )
+    )
 
 
 def summary_from_seeds(seeds: pd.DataFrame, target_on_time: float) -> Summary:
@@ -270,7 +296,7 @@ def summary_from_seeds(seeds: pd.DataFrame, target_on_time: float) -> Summary:
     }
     on_time = metrics.get("on_time_rate")
     meets = None if on_time is None else bool(on_time.mean >= target_on_time)
-    return Summary(metrics, meets)
+    return Summary(metrics, meets, len(seeds))
 
 
 # --- run folder loaders --------------------------------------------------------------
@@ -300,10 +326,23 @@ def read_checked_parquet(path: Path, spec: TableSpec) -> Loaded[pd.DataFrame]:
     if missing:
         return Loaded(None, f"{spec.path} lacks columns: {', '.join(missing)}")
     for column in spec.date_columns:
+        if column not in df.columns:
+            continue
+        if pd.api.types.is_integer_dtype(df[column]):
+            # hiring_plan stores months as indices (0 = first plan month).
+            df[column] = [month_from_index(int(i)) for i in df[column]]
         # date32 arrives as Python dates (object dtype); plotly and groupby
         # want real datetimes.
         df[column] = pd.to_datetime(df[column])
     return Loaded(df)
+
+
+def month_from_index(index: int) -> pd.Timestamp:
+    """Month index -> first day of that month (0 = the plan year's first month)."""
+    from scout_planner.generate import SIM_START  # a constant; nothing is generated
+
+    total = SIM_START.year * 12 + SIM_START.month - 1 + index
+    return pd.Timestamp(year=total // 12, month=total % 12 + 1, day=1)
 
 
 def load_table(run_path: Path, table: str) -> Loaded[pd.DataFrame]:
@@ -512,35 +551,71 @@ def params_for_sweep_row(
 # --- joins for charts (pure) -------------------------------------------------------
 
 
-def monthly_on_time(outcomes: pd.DataFrame, raw_requests: pd.DataFrame) -> pd.DataFrame:
+def scored_outcomes(outcomes: pd.DataFrame) -> pd.DataFrame:
+    """Only the requests whose due date fell inside the simulated period.
+
+    Requests due later are right-censored: the year ended before we could know
+    whether they would be on time, so they count neither way.
+    """
+    if "scored" not in outcomes.columns:
+        return outcomes
+    return outcomes[outcomes["scored"].astype(bool)]
+
+
+def monthly_on_time(outcomes: pd.DataFrame) -> pd.DataFrame:
     """On-time rate per repeat and **due** month: ``seed, month, on_time_rate, n``.
 
-    Due month, not completion month: a report that is never delivered still
-    counts against the month it was promised for.
+    Scored requests only. Due month, not completion month: a report that is
+    never delivered still counts against the month it was promised for. Uses
+    the outcome's own ``due_date``: each repeat simulates different requests,
+    so joining to ``raw/`` by ``request_id`` would be wrong for repeats >= 2.
     """
-    due = raw_requests[["request_id", "due_date"]]
-    joined = outcomes[["seed", "request_id", "on_time"]].merge(due, on="request_id", how="inner")
-    if joined.empty:
+    scored = scored_outcomes(outcomes)
+    if scored.empty:
         return pd.DataFrame(columns=["seed", "month", "on_time_rate", "n"])
-    joined["month"] = joined["due_date"].dt.to_period("M").dt.to_timestamp()
-    grouped = joined.groupby(["seed", "month"], as_index=False).agg(
+    df = scored[["seed", "on_time"]].copy()
+    df["month"] = pd.to_datetime(scored["due_date"]).dt.to_period("M").dt.to_timestamp()
+    return df.groupby(["seed", "month"], as_index=False).agg(
         on_time_rate=("on_time", "mean"), n=("on_time", "size")
     )
-    return grouped
 
 
-def monthly_demand(raw_requests: pd.DataFrame, history_months_shown: int = 12) -> pd.DataFrame:
-    """Requests received per month: ``month, requests, period``.
+def monthly_demand(
+    raw_requests: pd.DataFrame,
+    outcomes: pd.DataFrame | None = None,
+    history_months_shown: int = 12,
+) -> pd.DataFrame:
+    """Requests received per month: ``month, requests, requests_min, requests_max, period``.
 
-    Keeps the last ``history_months_shown`` history months and every future month.
+    History (shared by every repeat) comes from ``raw/requests``; the last
+    ``history_months_shown`` months are kept. Plan-year months come from the
+    outcomes when given: every arrived request, per repeat, as mean / min /
+    max over repeats (each repeat draws its own demand). Without outcomes the
+    plan year falls back to ``raw/`` (which is repeat 1's world).
     """
-    df = raw_requests[["received_date", "period"]].copy()
-    df["month"] = df["received_date"].dt.to_period("M").dt.to_timestamp()
-    counts = df.groupby(["month", "period"], as_index=False).size()
-    counts = counts.rename(columns={"size": "requests"})
-    history = counts[counts["period"] == "history"].sort_values("month")
-    future = counts[counts["period"] != "history"].sort_values("month")
-    return pd.concat([history.tail(history_months_shown), future], ignore_index=True)
+
+    def per_month(df: pd.DataFrame, by: list[str]) -> pd.DataFrame:
+        months = pd.to_datetime(df["received_date"]).dt.to_period("M").dt.to_timestamp()
+        return df.assign(month=months).groupby([*by, "month"], as_index=False).size()
+
+    raw = raw_requests
+    history = per_month(raw[raw["period"] == "history"], []).rename(columns={"size": "requests"})
+    history = history.sort_values("month").tail(history_months_shown)
+    history = history.assign(
+        requests_min=history["requests"], requests_max=history["requests"], period="history"
+    )
+    if outcomes is not None and not outcomes.empty:
+        counts = per_month(outcomes, ["seed"])
+        future = counts.groupby("month", as_index=False)["size"].agg(["mean", "min", "max"])
+        future = future.rename(
+            columns={"mean": "requests", "min": "requests_min", "max": "requests_max"}
+        )
+    else:
+        future = per_month(raw[raw["period"] != "history"], []).rename(columns={"size": "requests"})
+        future = future.assign(requests_min=future["requests"], requests_max=future["requests"])
+    future = future.assign(period="future").sort_values("month")
+    columns = ["month", "requests", "requests_min", "requests_max", "period"]
+    return pd.concat([history[columns], future[columns]], ignore_index=True)
 
 
 def forecast_totals(forecast: pd.DataFrame) -> pd.DataFrame:
@@ -553,8 +628,11 @@ def forecast_totals(forecast: pd.DataFrame) -> pd.DataFrame:
 
 
 def seeds_late_reports(seeds: pd.DataFrame) -> MetricStat:
-    """Late reports per repeat, exact from ``seeds.parquet``."""
-    late = seeds["n_requests"] * (1 - seeds["on_time_rate"])
+    """Late reports per repeat, exact from ``seeds.parquet`` (``n_late``)."""
+    if "n_late" in seeds.columns:
+        late = seeds["n_late"].astype(float)
+    else:
+        late = seeds["n_requests"] * (1 - seeds["on_time_rate"])
     return MetricStat(float(late.mean()), float(late.min()), float(late.max()))
 
 

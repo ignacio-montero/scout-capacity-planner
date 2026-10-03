@@ -211,8 +211,15 @@ def confirm_popover(
 
 
 def kpi_row(summary: Summary, params: Params, late: Any = None) -> None:
+    """The four KPI cards as a 2x2 grid.
+
+    Four cards in one row truncate labels and values ("Turnaroun…", "3,41…")
+    once the window is ~800 px wide with the sidebar open; Streamlit can't
+    tell the page width, so the grid is the layout that works at every width.
+    """
     cards = kpi_cards(summary, params, late)
-    for col, card in zip(st.columns(len(cards)), cards, strict=True):
+    cells = [col for _ in range(0, len(cards), 2) for col in st.columns(2, gap="medium")]
+    for col, card in zip(cells, cards, strict=False):
         with col:
             st.metric(
                 card.label,

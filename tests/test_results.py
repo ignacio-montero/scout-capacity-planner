@@ -77,10 +77,13 @@ def test_demo_outputs_are_consistent(demo) -> None:
     path = run_path(demo, "Demo: Defaults")
     seeds = load_table(path, "seeds").value
     outcomes = load_table(path, "outcomes").value
-    per_seed = outcomes.groupby("seed")["on_time"].mean()
+    scored = outcomes[outcomes["scored"]]
+    per_seed = scored.groupby("seed")["on_time"].mean()
     assert per_seed.to_numpy() == pytest.approx(seeds.set_index("seed")["on_time_rate"].to_numpy())
     late = seeds_late_reports(seeds)
-    assert late.mean == pytest.approx((~outcomes["on_time"]).sum() / seeds["seed"].nunique())
+    assert late.mean == pytest.approx((~scored["on_time"]).sum() / seeds["seed"].nunique())
+    assert late.mean == pytest.approx(seeds["n_late"].mean())  # exact n_late is used
+    assert (~outcomes["scored"]).sum() == seeds["n_censored"].sum()
 
 
 def test_running_run_has_no_results_yet(demo) -> None:
@@ -114,6 +117,24 @@ def test_parse_summary_tolerates_plain_numbers() -> None:
     assert loaded.value.mean("cost_total") == 1.0
     assert loaded.value.meets_target is False
     assert not parse_summary([1, 2]).ok
+
+
+def test_parse_summary_keeps_extras_out_of_metrics() -> None:
+    loaded = parse_summary(
+        {
+            "on_time_rate": {"mean": 0.9, "min": 0.9, "max": 0.9},
+            "n_late": {"mean": 12, "min": 10, "max": 14},
+            "n_censored": {"mean": 300, "min": 290, "max": 310},
+            "p90_turnaround_days": {"mean": None, "min": None, "max": None},
+            "meets_target": False,
+            "n_seeds": 3,
+            "diagnostics": {"fallbacks": 2, "per_seed": []},
+        }
+    ).value
+    assert set(loaded.metrics) == {"on_time_rate", "n_late", "n_censored"}  # null metric skipped
+    assert loaded.n_seeds == 3
+    assert loaded.diagnostics["fallbacks"] == 2
+    assert loaded.late_reports() == 12  # exact n_late beats the approximation
 
 
 def test_summary_from_seeds_and_flat() -> None:
@@ -181,12 +202,46 @@ def test_flatten_params() -> None:
 def test_monthly_joins(demo) -> None:
     path = run_path(demo, "Demo: Defaults")
     outcomes, raw = load_table(path, "outcomes").value, load_table(path, "raw_requests").value
-    monthly = monthly_on_time(outcomes, raw)
+    monthly = monthly_on_time(outcomes)
     assert set(monthly.columns) == {"seed", "month", "on_time_rate", "n"}
-    assert monthly["n"].sum() == len(outcomes)
-    demand = monthly_demand(raw)
+    # every scored request of every repeat, even though repeats 2+ have ids not in raw/
+    assert monthly["n"].sum() == int(outcomes["scored"].sum())
+    assert monthly["seed"].nunique() == outcomes["seed"].nunique()
+    demand = monthly_demand(raw, outcomes)
     assert (demand["period"] == "history").sum() == 12
     assert (demand["period"] == "future").sum() == 12
+    assert (demand["requests_min"] <= demand["requests"]).all()
+    assert (demand["requests"] <= demand["requests_max"]).all()
+    assert monthly_demand(raw)["period"].eq("future").sum() == 12  # raw-only fallback
+
+
+def test_monthly_on_time_uses_own_dates_and_skips_censored() -> None:
+    """Regression: repeats >= 2 simulate different requests than raw/, and requests
+    due after the year ends are censored. Neither may leak into the monthly rate."""
+    outcomes = pd.DataFrame(
+        {
+            "seed": [1, 1, 2, 2, 2],
+            "request_id": ["R1", "R2", "X9", "X8", "X7"],  # repeat 2: ids unknown to raw/
+            "on_time": [True, False, True, True, False],
+            "scored": [True, True, True, True, False],
+            "due_date": pd.to_datetime(
+                ["2027-03-10", "2027-03-20", "2027-03-05", "2027-04-02", "2028-01-05"]
+            ),
+        }
+    )
+    monthly = monthly_on_time(outcomes)
+    rows = {(r.seed, r.month.month): (r.on_time_rate, r.n) for r in monthly.itertuples()}
+    assert rows == {(1, 3): (0.5, 2), (2, 3): (1.0, 1), (2, 4): (1.0, 1)}
+
+
+def test_hiring_plan_month_indices_become_dates(tmp_path: Path) -> None:
+    pd.DataFrame(
+        {"month_to_act": [-2, 0], "joins_month": [1, 3], "skill_type": ["A", "B"],
+         "hire_type": ["freelance", "full_time"], "count": [1, 2], "reason": ["x", "y"]}
+    ).to_parquet(tmp_path / "hiring_plan.parquet")  # fmt: skip
+    plan = load_table(tmp_path, "hiring_plan").value
+    assert plan["joins_month"].dt.strftime("%Y-%m").tolist() == ["2027-02", "2027-04"]
+    assert plan["month_to_act"].dt.strftime("%Y-%m").tolist() == ["2026-11", "2027-01"]
 
 
 def test_unreadable_folder_is_listed_not_fatal(demo) -> None:
