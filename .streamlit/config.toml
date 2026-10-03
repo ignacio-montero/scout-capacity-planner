@@ -1,0 +1,9 @@
+# Only the primary colour is set ("pitch green"; DESIGN_SYSTEM.md section 2.1).
+# Streamlit's default red would read as "danger", and red is reserved for "late".
+# No `base`: the app follows the user's light/dark setting.
+[theme]
+primaryColor = "#237A4B"
+
+# Local-only tool: listen on this machine only, never on the LAN.
+[server]
+address = "localhost"

@@ -27,6 +27,7 @@ import argparse
 import atexit
 import contextlib
 import logging
+import os
 import signal
 import subprocess
 import sys
@@ -138,7 +139,9 @@ def main(argv: Sequence[str] | None = None, app_cmd: Sequence[str] | None = None
             worker = subprocess.Popen(worker_command(args.root, args.pipeline))
             log.info("started worker (pid %d)", worker.pid)
 
-        app = subprocess.Popen(list(app_cmd))
+        # The app reads its runs folder from SCOUT_RUNS_ROOT; keep it in step with the worker.
+        app_env = {**os.environ, "SCOUT_RUNS_ROOT": str(args.root)}
+        app = subprocess.Popen(list(app_cmd), env=app_env)
         try:
             code = app.wait()
         except KeyboardInterrupt:
