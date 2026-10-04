@@ -4,7 +4,8 @@ name: cadence
 base: config/default.yaml
 vary:
   assignment.cadence: [daily, weekly]
-  assignment.policy: [fcfs, edf, optimiser]
+  assignment.policy: [fcfs, edf, edf_feasible, optimiser]
 fixed:
   demand.actual_growth: 4.0
   sim.seeds: 3
+  assignment.time_limit_s: 0.3

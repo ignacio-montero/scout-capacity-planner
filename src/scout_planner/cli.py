@@ -401,18 +401,22 @@ def cmd_sweep(args: argparse.Namespace) -> int:
         f"\nsweep {spec.name}: {len(run_ids) - failures}/{len(run_ids)} runs done "
         f"in {time.perf_counter() - started:.0f} s"
     )
-    if args.publish:
-        _publish(spec, sweep_id, args)
+    if args.publish and _publish(spec, sweep_id, args) != 0:
+        return 1
     return 0 if failures == 0 else 1
 
 
 def _publish(spec: sweep.SweepSpec, sweep_id: str, args: argparse.Namespace) -> int:
     try:
-        path = sweep.publish(spec, sweep_id, args.root, args.published_dir)
+        path = sweep.publish(
+            spec, sweep_id, args.root, args.published_dir, allow_partial=args.allow_partial
+        )
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
-    print(f"published {path}")
+    info = sweep.read_publish_info(path) or {}
+    partial = " (PARTIAL)" if info.get("partial") else ""
+    print(f"published {path}: {info.get('done_runs')}/{info.get('expected_runs')} runs{partial}")
     return 0
 
 
@@ -461,6 +465,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sw.add_argument("--publish", action="store_true", help="write the published summary")
     sw.add_argument("--sweep-id", default=None, help="with --publish-only: which execution")
+    sw.add_argument(
+        "--allow-partial",
+        action="store_true",
+        help="publish even if some runs of the sweep are not done (recorded in the file)",
+    )
     sw.add_argument(
         "--published-dir", type=Path, default=sweep.PUBLISHED_DIR, help="where --publish writes"
     )

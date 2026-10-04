@@ -1,10 +1,10 @@
 # The do-nothing baseline: 4x growth arrives and nobody is hired (the hiring
 # plan is ignored). How far do assignment policy and the pre-screen tool get
-# the current team on their own? 3 x 2 = 6 runs x 3 seeds.
+# the current team on their own? 4 x 2 = 8 runs x 3 seeds.
 name: baseline
 base: config/default.yaml
 vary:
-  assignment.policy: [fcfs, edf, optimiser]
+  assignment.policy: [fcfs, edf, edf_feasible, optimiser]
   automation.enabled: [false, true]
 fixed:
   demand.actual_growth: 4.0

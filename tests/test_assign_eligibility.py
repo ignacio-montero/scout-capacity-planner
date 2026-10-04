@@ -12,6 +12,7 @@ import datetime as dt
 import pytest
 
 from scout_planner.assign.eligibility import (
+    DueDateLedger,
     check_inputs,
     deadline_index,
     due_date_violations,
@@ -276,3 +277,23 @@ def test_due_date_check_counts_frozen_work_first() -> None:
     # 12 h frozen + 4 h due by Tuesday > 15 h by Tuesday: the deadline moves to
     # Wednesday (first day it could be done), so the item is late but still legal.
     assert due_date_violations(pool, [make_state(frozen=12.0)], WINDOW, answer) == []
+
+
+def test_due_date_ledger_matches_the_violation_check() -> None:
+    """Adding items one by one through the ledger never builds a violating answer."""
+    state = make_state()
+    ledger = DueDateLedger([state], WINDOW)
+    first, second = (
+        make_item("T00001-desk", hours=5.0, due=D0),
+        make_item("T00002-desk", hours=5.0, due=D0),
+    )
+    assert ledger.fits(first, "S001")
+    ledger.add(first, "S001")
+    assert not ledger.fits(second, "S001")  # 10 h due today > 7.5 h today
+    later = make_item("T00003-desk", hours=5.0, due=day(1))
+    assert ledger.fits(later, "S001")  # 10 h by tomorrow <= 15 h
+    ledger.add(later, "S001")
+    answer = [Assignment("T00001-desk", "S001"), Assignment("T00003-desk", "S001")]
+    assert due_date_violations([first, later], [state], WINDOW, answer) == []
+    short = DueDateLedger([state], WINDOW, commit_by=0)
+    assert short.deadline(make_item(hours=4.0, due=day(9)), "S001") == 0

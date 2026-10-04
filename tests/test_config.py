@@ -56,7 +56,7 @@ SPEC_DEFAULTS: dict[str, Any] = {
     "automation.rework_rate": 0.15,
     "automation.rework_overhead_hours": 1.0,
     "automation.monthly_cost": 1500,
-    "assignment.policy": "optimiser",
+    "assignment.policy": "edf_feasible",
     "assignment.cadence": "daily",
     "assignment.unit": "task",
     "assignment.horizon_days": 7,
@@ -221,6 +221,21 @@ def test_out_of_range_values_are_rejected(key: str, value: Any) -> None:
 def test_wrong_types_are_not_coerced(key: str, value: Any) -> None:
     with pytest.raises(ValidationError):
         apply_overrides(Params(), {key: value})
+
+
+def test_weekly_cadence_needs_a_week_long_horizon() -> None:
+    with pytest.raises(ValidationError, match="horizon_days >= 7"):
+        apply_overrides(Params(), {"assignment.cadence": "weekly", "assignment.horizon_days": 3})
+    ok = apply_overrides(Params(), {"assignment.cadence": "weekly", "assignment.horizon_days": 7})
+    assert ok.assignment.horizon_days == 7
+    daily = apply_overrides(Params(), {"assignment.horizon_days": 3})  # daily: any horizon
+    assert daily.assignment.cadence == "daily"
+
+
+def test_policy_accepts_the_strong_baseline() -> None:
+    assert apply_overrides(Params(), {"assignment.policy": "edf_feasible"}).assignment.policy == (
+        "edf_feasible"
+    )
 
 
 def test_empty_team_is_rejected() -> None:

@@ -73,7 +73,8 @@ def test_unknown_or_invalid_parameters_fail_at_expansion(tmp_path) -> None:
 
 
 @pytest.mark.parametrize(
-    "name", ["quick", "cadence", "headline", "growth", "forecast_error", "baseline"]
+    "name",
+    ["quick", "cadence", "headline", "growth", "forecast_error", "baseline", "late_penalty"],
 )
 def test_shipped_sweep_files_expand(name) -> None:
     spec = sweep.load_sweep(SWEEPS_DIR / f"{name}.yaml")
@@ -115,8 +116,10 @@ def test_publish_flattens_one_row_per_finished_run(tmp_path) -> None:
     sweep_id, run_ids = sweep.queue_sweep(spec, root)
     for k, run_id in enumerate(run_ids[:-1]):
         _finish(run_id, root, 0.90 + 0.01 * k)
-    # the last one stays queued: not published
-    path = sweep.publish(spec, sweep_id, root, out_dir=tmp_path / "published")
+    # the last one stays queued: refused by default, published with allow_partial
+    with pytest.raises(sweep.IncompleteSweep, match="5 of 6 runs are done"):
+        sweep.publish(spec, sweep_id, root, out_dir=tmp_path / "published")
+    path = sweep.publish(spec, sweep_id, root, out_dir=tmp_path / "published", allow_partial=True)
     assert path.name == "mini_summary.parquet"
     df = pd.read_parquet(path)
     assert len(df) == 5
@@ -133,6 +136,12 @@ def test_publish_flattens_one_row_per_finished_run(tmp_path) -> None:
     row = df.set_index("run_id").loc[run_ids[0]]
     assert row["assignment.policy"] == "fcfs" and row["on_time_rate_mean"] == pytest.approx(0.90)
     assert not row["meets_target"]
+    assert set(df["sweep_expected_runs"]) == {6} and set(df["sweep_done_runs"]) == {5}
+    assert set(df["sweep_id"]) == {sweep_id}
+    assert sweep.read_publish_info(path) == {
+        "sweep": "mini", "sweep_id": sweep_id, "expected_runs": 6, "done_runs": 5,
+        "partial": True,
+    }  # fmt: skip
     assert sweep.latest_sweep_id("mini", root) == sweep_id
 
 
@@ -140,8 +149,10 @@ def test_publish_without_finished_runs_is_an_error(tmp_path) -> None:
     root = tmp_path / "runs"
     spec = sweep.load_sweep(_write(tmp_path, SPEC))
     sweep_id, _ = sweep.queue_sweep(spec, root)
-    with pytest.raises(ValueError, match="no finished runs"):
+    with pytest.raises(sweep.IncompleteSweep, match="0 of 6"):
         sweep.publish(spec, sweep_id, root, out_dir=tmp_path / "published")
+    with pytest.raises(ValueError, match="no finished runs"):
+        sweep.publish(spec, sweep_id, root, out_dir=tmp_path / "published", allow_partial=True)
 
 
 def test_cli_sweep_queue_only_queues(tmp_path, capsys) -> None:
@@ -310,11 +321,11 @@ def test_publish_is_atomic_and_leaves_no_temp_files(tmp_path, monkeypatch) -> No
     first = sweep.publish(spec, sweep_id, root, out_dir=out)
     before = first.read_bytes()
 
-    def broken(self, path, **kwargs):
+    def broken(table, path, **kwargs):
         Path(path).write_bytes(b"half a file")
         raise OSError("disk full")
 
-    monkeypatch.setattr(pd.DataFrame, "to_parquet", broken)
+    monkeypatch.setattr(sweep.pq, "write_table", broken)
     with pytest.raises(OSError, match="disk full"):
         sweep.publish(spec, sweep_id, root, out_dir=out)
     assert first.read_bytes() == before  # the old file is untouched
@@ -351,3 +362,67 @@ def test_sweeps_run_concurrently_into_different_roots_and_publish_together(tmp_p
     ]
     for name in ("left", "right"):
         assert len(pd.read_parquet(published / f"{name}_summary.parquet")) == 2
+
+
+# --- completeness, diagnostics, latest execution ----------------------------------------
+
+
+def test_publish_refuses_a_sweep_with_a_failed_run_and_cli_reports_it(tmp_path, capsys) -> None:
+    root, out = tmp_path / "runs", tmp_path / "pub"
+    path = _write(tmp_path, SPEC)
+    spec = sweep.load_sweep(path)
+    sweep_id, run_ids = sweep.queue_sweep(spec, root)
+    for run_id in run_ids[1:]:
+        _finish(run_id, root, 0.96)
+    runs.update_status(run_ids[0], root=root, state="running")
+    runs.update_status(run_ids[0], root=root, state="failed", error="boom")
+    argv = ["sweep", "--sweep", str(path), "--root", str(root), "--publish-only",
+            "--published-dir", str(out)]  # fmt: skip
+    assert cli.main(argv) == 2
+    assert "5 of 6 runs are done" in capsys.readouterr().err
+    assert not out.exists() or not list(out.iterdir())
+    assert cli.main([*argv, "--allow-partial"]) == 0
+    assert "5/6 runs (PARTIAL)" in capsys.readouterr().out
+    assert len(pd.read_parquet(out / "mini_summary.parquet")) == 5
+
+
+def test_published_table_carries_each_runs_solver_diagnostics(tmp_path) -> None:
+    root = tmp_path / "runs"
+    spec = sweep.load_sweep(_write(tmp_path, SPEC))
+    sweep_id, run_ids = sweep.queue_sweep(spec, root)
+    for k, run_id in enumerate(run_ids):
+        _finish(run_id, root, 0.9)
+        folder = runs.run_dir(run_id, root)
+        summary = json.loads((folder / "summary.json").read_text())
+        summary["diagnostics"] = {
+            "optimiser_solves": 100, "fallbacks": k, "fallback_share": k / 100,
+            "wall_clock_hits": 0, "status_FEASIBLE": 90 - k, "status_UNKNOWN": k,
+            "per_seed": [{"seed": 0}],
+        }  # fmt: skip
+        (folder / "summary.json").write_text(json.dumps(summary))
+    df = pd.read_parquet(sweep.publish(spec, sweep_id, root, out_dir=tmp_path / "pub"))
+    for col in ("diag_optimiser_solves", "diag_fallbacks", "diag_fallback_share",
+                "diag_wall_clock_hits", "diag_status_FEASIBLE", "diag_status_UNKNOWN"):  # fmt: skip
+        assert col in df.columns, col
+    assert "diag_per_seed" not in df.columns
+    row = df.set_index("run_id").loc[run_ids[3]]
+    assert row["diag_fallbacks"] == 3 and row["diag_fallback_share"] == pytest.approx(0.03)
+
+
+@pytest.mark.parametrize(
+    ("ids", "expected"),
+    [
+        # optimiser_eval vs optimiser_eval_fast: both slugs start "optimiser-eval-"
+        (["optimiser-eval-20261001-090000", "optimiser-eval-fast-20261003-090000"],
+         "optimiser-eval-20261001-090000"),
+        (["optimiser-eval-20261002-235959", "optimiser-eval-20261003-000001",
+          "optimiser-eval-20261001-120000"], "optimiser-eval-20261003-000001"),
+        (["optimiser-eval-fast-20261003-090000"], None),
+        (["optimiser-eval-2026-oops"], None),
+    ],
+)  # fmt: skip
+def test_latest_sweep_id_matches_the_exact_name_and_sorts_by_time(tmp_path, ids, expected) -> None:
+    root = tmp_path / "runs"
+    for sweep_id in ids:
+        runs.create_run(load_default_params(), "r", sweep_id, root=root)
+    assert sweep.latest_sweep_id("optimiser_eval", root) == expected

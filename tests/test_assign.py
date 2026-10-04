@@ -45,7 +45,8 @@ CFG = AssignmentParams(
 )
 DEFAULTS = AssignmentParams()
 ALL = sorted(POLICIES)
-GREEDY = ["edf", "fcfs"]
+GREEDY = ["edf", "edf_feasible", "fcfs"]
+DUE_DATE_SAFE = {"edf_feasible", "optimiser"}  # never promise work past its deadline
 
 
 def day(n: int) -> dt.date:
@@ -129,7 +130,7 @@ def answer_of(
 ) -> list[Assignment]:
     """Run one policy and check every hard constraint (plus due dates for the optimiser)."""
     answer = get_policy(name)(pool, scouts, WINDOW, cfg, np.random.default_rng(seed), cost=COST)
-    strict = name == "optimiser"
+    strict = name in DUE_DATE_SAFE
     assert validate_assignments(pool, scouts, WINDOW, answer, check_due_dates=strict) == []
     return answer
 
@@ -177,7 +178,7 @@ def replay_on_time(pool: list[WorkItem], scouts: list[ScoutState], answer: list[
 
 
 def test_registry_has_the_three_policies_with_one_signature() -> None:
-    assert set(POLICIES) == {"fcfs", "edf", "optimiser"}
+    assert set(POLICIES) == {"fcfs", "edf", "edf_feasible", "optimiser"}
     for policy in POLICIES.values():
         params = inspect.signature(policy).parameters
         assert list(params) == ["pool", "scouts", "window", "cfg", "rng", "cost"]
@@ -395,6 +396,50 @@ def test_greedy_commitments_claim_hours_before_new_items(name: str) -> None:
     assert run(name, pool, scouts) == {"T00002-desk": "S001"}
 
 
+def test_edf_feasible_never_promises_more_than_a_day_holds() -> None:
+    pool = [make_item(f"T0000{k}-desk", hours=5.0, due=D0) for k in (1, 2)]
+    scouts = [make_state("S001")]
+    assert len(run("edf", pool, scouts)) == 2
+    assert len(run("edf_feasible", pool, scouts)) == 1
+
+
+def test_edf_feasible_tries_the_next_scout_freelancers_included() -> None:
+    """Two 5 h items due today. EDF piles both on S001 (most hours); the
+    due-date check sends the second to the freelancer, who can do it today."""
+    pool = [make_item(f"T0000{k}-desk", hours=5.0, due=D0) for k in (1, 2)]
+    scouts = [make_state("S001"), make_state("S002", freelance=True, weekday_hours=6.0)]
+    assert run("edf", pool, scouts) == {"T00001-desk": "S001", "T00002-desk": "S001"}
+    assert run("edf_feasible", pool, scouts) == {"T00001-desk": "S001", "T00002-desk": "S002"}
+
+
+def test_edf_feasible_keeps_a_feasible_commitment_and_replaces_a_broken_one() -> None:
+    pool = [
+        make_item("T00001-desk", hours=5.0, due=D0, current="S001"),
+        make_item("T00002-desk", hours=5.0, due=D0, current="S001"),
+    ]
+    scouts = [make_state("S001"), make_state("S002", weekday_hours=6.0)]
+    assert run("edf", pool, scouts) == {"T00001-desk": "S001", "T00002-desk": "S001"}
+    # The second commitment would break S001's day: a forced move, not churn.
+    assert run("edf_feasible", pool, scouts) == {"T00001-desk": "S001", "T00002-desk": "S002"}
+
+
+def test_edf_feasible_ignores_the_commitment_horizon_but_the_hint_variant_obeys_it() -> None:
+    from scout_planner.assign.greedy import edf_feasible_assign
+
+    pool = [make_item(f"T0000{k}-desk", hours=6.0) for k in (1, 2, 3, 4)]
+    scouts = [make_state("S001")]
+    short = CFG.model_copy(update={"commit_buffer_days": 0})
+    assert len(run("edf_feasible", pool, scouts, short)) == 4  # whole window
+    assert len(edf_feasible_assign(pool, scouts, WINDOW, commit_by=0)) == 1
+
+
+def test_edf_feasible_is_deterministic_and_feasible_on_random_instances() -> None:
+    pool, scouts = random_instance(200, 40, seed=9)
+    first = answer_of("edf_feasible", pool, scouts, DEFAULTS)
+    assert first == answer_of("edf_feasible", pool, scouts, DEFAULTS)
+    assert len(first) > 0
+
+
 # --- what the optimiser buys --------------------------------------------------------
 
 
@@ -420,7 +465,9 @@ def test_optimiser_beats_edf_on_a_tight_deadline_case() -> None:
     """Counted by a day-by-day replay of each scout's queue, not by the policies' own view."""
     pool, scouts = tight_deadline_case()
     on_time = {name: replay_on_time(pool, scouts, answer_of(name, pool, scouts)) for name in ALL}
-    assert on_time == {"edf": 2, "fcfs": 2, "optimiser": 3}
+    # edf_feasible refuses the over-promise but cannot see that the scarce
+    # two-skill scout should be kept for the FWD item: still 2.
+    assert on_time == {"edf": 2, "edf_feasible": 2, "fcfs": 2, "optimiser": 3}
 
     # EDF promised more than a scout can do by the due date; the optimiser never does.
     edf_answer = answer_of("edf", pool, scouts)
@@ -810,6 +857,35 @@ def test_optimiser_respects_its_time_limit() -> None:
     assert problems == []
 
 
+def test_solve_counters_for_a_simulation_to_sum() -> None:
+    pool, scouts = tight_deadline_case()
+    cfg = CFG.model_copy(update={"policy": "optimiser"})
+    out = assign_with_report(pool, scouts, WINDOW, cfg, np.random.default_rng(0), cost=COST)
+    assert out.diagnostics == {
+        "solves_optimal": 1,
+        "solves_feasible": 0,
+        "solves_unknown": 0,
+        "solve_gap_sum": 0.0,
+    }
+    empty = assign_with_report([], scouts, WINDOW, cfg, np.random.default_rng(0), cost=COST)
+    assert empty.diagnostics == {}  # nothing solved
+    greedy = CFG.model_copy(update={"policy": "edf_feasible"})
+    out = assign_with_report(pool, scouts, WINDOW, greedy, np.random.default_rng(0), cost=COST)
+    assert out.diagnostics == {}
+
+
+def test_solve_counters_mark_unknown_and_carry_the_gap() -> None:
+    unknown = opt.SolveReport([], "UNKNOWN", None, None, None, 0.1, 0.1, fell_back_to_edf=True)
+    assert unknown.counters()["solves_unknown"] == 1 and unknown.counters()["solve_gap_sum"] == 0
+    feasible = opt.SolveReport([], "FEASIBLE", 10.0, 8.0, 0.2, 1.0, 1.0)
+    assert feasible.counters() == {
+        "solves_optimal": 0,
+        "solves_feasible": 1,
+        "solves_unknown": 0,
+        "solve_gap_sum": 0.2,
+    }
+
+
 def test_wall_clock_backstop_is_far_above_the_limit() -> None:
     assert opt.wall_clock_cap(0.1) == pytest.approx(5.1)
     assert opt.wall_clock_cap(1.0) == pytest.approx(10.0)
@@ -842,8 +918,8 @@ def test_optimiser_falls_back_to_edf_when_the_solver_finds_nothing(
             pool, scouts, WINDOW, CFG, np.random.default_rng(0), cost=COST
         )
     assert report.fell_back_to_edf and report.status == "UNKNOWN" and report.hit_wall_clock
-    assert report.assignments == answer_of("edf", pool, scouts)
-    assert "falling back to EDF" in caplog.text
+    assert report.assignments == answer_of("edf_feasible", pool, scouts)
+    assert "falling back to edf_feasible" in caplog.text
 
 
 def test_an_infeasible_model_is_a_bug_and_raises(monkeypatch: pytest.MonkeyPatch) -> None:

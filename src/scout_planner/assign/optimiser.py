@@ -80,12 +80,14 @@ Determinism vs wall-clock time
     workers (faster on big models, not reproducible); no limit at all (proves
     optimality on small days but can stall a whole simulated year on a busy one).
 
-Warm start: the EDF answer, trimmed to what the model allows, is passed as a
-complete, feasible *solution hint* (continuity helpers included), so the
-solver has a first solution almost at once and only searches for
-improvements. Measured: with a partial hint, a 0.1 s budget on 400 items ended
-with no solution at all. If the solver is still empty-handed when stopped
-(status ``UNKNOWN``), the policy falls back to EDF and logs a warning.
+Warm start: EDF + due-date check under the model's own rules (commitment
+horizon included, ``greedy.edf_feasible_assign``) is passed as a complete,
+feasible *solution hint* (continuity helpers included), so the solver has a
+first solution almost at once and only searches for improvements. Measured:
+with a partial hint, a 0.1 s budget on 400 items ended with no solution at
+all. If the solver is still empty-handed when stopped (status ``UNKNOWN``),
+the policy falls back to ``edf_feasible`` and logs a warning
+(``SolveReport.fell_back_to_edf``; the name predates that policy).
 ``INFEASIBLE`` or ``MODEL_INVALID`` raise: assigning nothing is always
 feasible, so either one means a bug in the model.
 """
@@ -103,14 +105,16 @@ import numpy as np
 from ortools.sat.python import cp_model
 
 from scout_planner.assign.eligibility import (
+    RUN_INTERVAL_DAYS,
     check_inputs,
+    commit_index,
     deadline_index,
     eligible_scouts,
     free_by_day,
     planned_date,
     scaled_hours,
 )
-from scout_planner.assign.greedy import edf
+from scout_planner.assign.greedy import edf_feasible, edf_feasible_assign
 from scout_planner.config import FULL_TIME_WEEKLY_HOURS, AssignmentParams, CostParams
 from scout_planner.domain import Assignment, AssignmentWindow, Scout, ScoutState, WorkItem
 
@@ -124,7 +128,6 @@ DAY_HOURS = FULL_TIME_WEEKLY_HOURS / 5  # 7.5 h: one working day, for slack in d
 URGENCY_ZERO_SLACK = 1.0  # last chance to be on time: one full late penalty
 URGENCY_OVERDUE = 1.25  # already late: ranked above any still-savable request
 URGENCY_LOST_FIXTURE = URGENCY_OVERDUE  # a live view whose match is gone after this run
-RUN_INTERVAL_DAYS = {"daily": 1, "weekly": 7}  # days until the next assignment run
 SALARIED_TIE_BREAK = 0.01  # cost units per freelance hour: equal work goes to salaried first
 
 
@@ -188,26 +191,6 @@ def urgency(slack: float, *, overdue: bool) -> float:
 def next_run_date(window: AssignmentWindow, cfg: AssignmentParams) -> dt.date:
     """When the next assignment run happens, derived from ``assignment.cadence``."""
     return window.start + dt.timedelta(days=RUN_INTERVAL_DAYS[cfg.cadence])
-
-
-def commit_index(window: AssignmentWindow, cfg: AssignmentParams) -> int | None:
-    """Last window-day index by which committed non-live work must be finished.
-
-    ``assignment.commit_buffer_days`` days after the next run (daily cadence,
-    buffer 2: by the end of the day after tomorrow); ``None`` = the whole window.
-
-    Why: the model plans a week, but nothing is gained by *committing* work
-    that will only start in five days; tomorrow's run sees more (new
-    arrivals, finished work, rework) and can still place it. Committing the
-    whole window also made the optimiser indifferent between starting a desk
-    review today and on day 6 (both "finish by the due date"), so it parked
-    work late and lost the buffer the write-up needed (M3 calibration). This
-    is the standard rolling-horizon rule: plan over the horizon, commit only
-    the first period (*frozen zone* / *commitment horizon*).
-    """
-    if cfg.commit_buffer_days is None:
-        return None
-    return RUN_INTERVAL_DAYS[cfg.cadence] - 1 + cfg.commit_buffer_days
 
 
 def is_perishable(item: WorkItem, next_run: dt.date) -> bool:
@@ -363,6 +346,24 @@ class SolveReport:
     fell_back_to_edf: bool = False
     hit_wall_clock: bool = False
 
+    def counters(self) -> dict[str, float]:
+        """This solve as additive counters, for a simulation to sum over its runs.
+
+        Keys (all present for every real solve; ``{}`` for status ``EMPTY``,
+        where nothing was solved): ``solves_optimal``, ``solves_feasible``,
+        ``solves_unknown`` (exactly one is 1), ``solve_gap_sum`` (this solve's
+        gap, 0 when there is none). Mean gap over a run =
+        ``solve_gap_sum / (solves_optimal + solves_feasible)``.
+        """
+        if self.status == "EMPTY":
+            return {}
+        return {
+            "solves_optimal": int(self.status == "OPTIMAL"),
+            "solves_feasible": int(self.status == "FEASIBLE"),
+            "solves_unknown": int(self.status not in ("OPTIMAL", "FEASIBLE")),
+            "solve_gap_sum": float(self.gap or 0.0),
+        }
+
 
 def solve_assignment(
     pool: Sequence[WorkItem],
@@ -443,7 +444,7 @@ def solve_assignment(
         current = (item_id, item.current_scout_id)
         if churn and current in x:
             terms.append(churn * (1 - x[current]))
-    hint = _edf_hint(pool, scouts, window, cfg, rng, cost, deadline, units, free)
+    hint = _edf_hint(pool, scouts, window, cfg, rng, cost, x)
     for key, var in x.items():
         model.add_hint(var, key in hint)
     terms.extend(_continuity_terms(model, x, by_item, items, w.continuity, hint))
@@ -469,12 +470,12 @@ def solve_assignment(
         raise RuntimeError(f"optimiser model is {status_name}: assigning nothing is feasible, bug")
     if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
         log.warning(
-            "optimiser found no feasible solution (%s) for %d items; falling back to EDF",
+            "optimiser found no feasible solution (%s) for %d items; falling back to edf_feasible",
             status_name,
             len(pool),
         )
         return SolveReport(
-            edf(pool, scouts, window, cfg, rng, cost=cost),
+            edf_feasible(pool, scouts, window, cfg, rng, cost=cost),
             status_name,
             None,
             None,
@@ -522,40 +523,17 @@ def _edf_hint(
     cfg: AssignmentParams,
     rng: np.random.Generator,
     cost: CostParams,
-    deadline: dict[tuple[str, str], int],
-    units: dict[str, int],
-    free: dict[str, list[int]],
+    x: dict[tuple[str, str], cp_model.IntVar],
 ) -> set[tuple[str, str]]:
-    """EDF's answer as ``(item_id, scout_id)`` pairs, trimmed to what the model allows.
+    """EDF + due-date check *with the commitment horizon*, as pairs: the warm start.
 
-    EDF only respects each scout's window total, in floats. The model also
-    asks for due-date capacity, in rounded integers. Pairs that would break it
-    are dropped, in EDF order: a hint must be feasible for CP-SAT to start
-    from it, and a *complete* feasible hint gives a first solution at once.
+    It obeys exactly the model's rules (due-date capacity through the same
+    ``DueDateLedger``, the commitment horizon, live-view dates), so it is a
+    complete, feasible hint and the solver has a first solution at once.
+    The intersection with ``x`` is only a safety net.
     """
-    n_days = window.n_days
-    due_units = {sid: [0] * n_days for sid in free}  # hinted units per deadline day
-    hint: set[tuple[str, str]] = set()
-    edf_answer = {a.item_id: a.scout_id for a in edf(pool, scouts, window, cfg, rng, cost=cost)}
-    for item in sorted(pool, key=lambda i: (i.due_date, i.received_date, i.item_id)):
-        sid = edf_answer.get(item.item_id)
-        key = (item.item_id, sid or "")
-        if sid is None or key not in deadline:
-            continue
-        j = deadline[key]
-        trial = due_units[sid].copy()
-        trial[j] += units[item.item_id]
-        running = 0
-        ok = True
-        for k in range(n_days):
-            running += trial[k]
-            if running > free[sid][k]:
-                ok = False
-                break
-        if ok:
-            due_units[sid] = trial
-            hint.add(key)
-    return hint
+    answer = edf_feasible_assign(pool, scouts, window, commit_index(window, cfg))
+    return {(a.item_id, a.scout_id) for a in answer} & set(x)
 
 
 def _continuity_terms(

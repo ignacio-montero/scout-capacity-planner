@@ -44,7 +44,7 @@ automation:                    # video pre-screen tool
   monthly_cost: 1500.0
 
 assignment:                    # daily who-does-which-work decision (D-010, D-011)
-  policy: optimiser            # fcfs | edf | optimiser
+  policy: edf_feasible         # fcfs | edf | edf_feasible | optimiser (D-030)
   cadence: daily               # daily | weekly
   unit: task                   # task | bundle
   horizon_days: 7              # rolling window each assignment run looks ahead

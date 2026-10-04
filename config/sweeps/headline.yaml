@@ -3,12 +3,12 @@
 # mix (the plan's full-time/freelance rule, freelancers only, full-timers
 # only), planning caution (P50 / P80 / P90 forecast) and the pre-screen tool
 # keeps >= 95% of reports within 14 days at the lowest total cost?
-# 3 x 3 x 3 x 2 = 54 runs x 3 seeds. Each run is one dot on the
+# 4 x 3 x 3 x 2 = 72 runs x 3 seeds. Each run is one dot on the
 # on-time vs cost chart; the cheapest dot above the 95% line is the answer.
 name: headline
 base: config/default.yaml
 vary:
-  assignment.policy: [fcfs, edf, optimiser]
+  assignment.policy: [fcfs, edf, edf_feasible, optimiser]
   capacity_plan.hire_mix: [rule, freelance_only, full_time_only]
   capacity_plan.quantile: [0.5, 0.8, 0.9]
   automation.enabled: [false, true]

@@ -160,7 +160,7 @@ class AssignmentWeights(_StrictModel):
 class AssignmentParams(_StrictModel):
     """How the daily (or weekly) assignment run decides who does which work item."""
 
-    policy: Literal["fcfs", "edf", "optimiser"] = "optimiser"
+    policy: Literal["fcfs", "edf", "edf_feasible", "optimiser"] = "edf_feasible"
     cadence: Literal["daily", "weekly"] = "daily"
     unit: Literal["task", "bundle"] = "task"
     horizon_days: int = Field(7, ge=1, le=14)
@@ -179,6 +179,18 @@ class AssignmentParams(_StrictModel):
     # Urgency uses slack minus the wait behind earlier-due work of the same
     # skill on the salaried team (so deferral looks expensive when queues are long).
     load_aware: bool = True
+
+    @model_validator(mode="after")
+    def _weekly_needs_a_week_of_horizon(self) -> AssignmentParams:
+        # With weekly runs, a fixture more than horizon_days after a Monday run is
+        # outside that run's window and has passed before the next one: live views
+        # on those days could never be assigned (critic S5).
+        if self.cadence == "weekly" and self.horizon_days < 7:
+            raise ValueError(
+                f"assignment.cadence 'weekly' needs assignment.horizon_days >= 7 "
+                f"(got {self.horizon_days}): fixtures between runs would be unreachable"
+            )
+        return self
 
 
 class CostParams(_StrictModel):

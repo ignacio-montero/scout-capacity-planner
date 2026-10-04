@@ -34,6 +34,7 @@ from __future__ import annotations
 import itertools
 import json
 import os
+import re
 import tempfile
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
@@ -42,6 +43,8 @@ from pathlib import Path
 from typing import Any
 
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 import yaml
 
 from scout_planner import metrics, runs
@@ -285,16 +288,76 @@ def summary_rows(spec: SweepSpec, sweep_id: str, root: Path | str | None = None)
     return pd.DataFrame(out)
 
 
+# Key of the parquet file metadata that records how complete a published sweep is.
+PUBLISH_METADATA_KEY = b"scout_planner.sweep"
+
+
+@dataclass(frozen=True)
+class SweepProgress:
+    """How many of a sweep execution's runs exist and how many finished (``done``)."""
+
+    expected: int  # combinations in the sweep file (or runs queued, if more)
+    queued: int  # runs in the run store with this sweep_id, any state
+    done: int
+
+    @property
+    def complete(self) -> bool:
+        return self.done >= self.expected
+
+
+def sweep_progress(spec: SweepSpec, sweep_id: str, root: Path | str | None = None) -> SweepProgress:
+    """Count a sweep execution's runs against what the sweep file expands to."""
+    mine = [s for s in runs.list_runs(root) if s.sweep_id == sweep_id]
+    done = sum(1 for s in mine if s.state == "done")
+    return SweepProgress(max(len(expand(spec)), len(mine)), len(mine), done)
+
+
+class IncompleteSweep(ValueError):
+    """``publish`` refused: some runs of the sweep are not ``done``."""
+
+
 def publish(
     spec: SweepSpec,
     sweep_id: str,
     root: Path | str | None = None,
     out_dir: Path | str = PUBLISHED_DIR,
+    *,
+    allow_partial: bool = False,
 ) -> Path:
-    """Write ``<out_dir>/<sweep name>_summary.parquet`` from the sweep's finished runs."""
+    """Write ``<out_dir>/<sweep name>_summary.parquet`` from the sweep's finished runs.
+
+    Refuses (:class:`IncompleteSweep`) when any expected run is missing,
+    failed, cancelled or unfinished, unless ``allow_partial``: a published
+    table with holes would quietly answer a different question (the cheapest
+    passing run may be the one that failed). Completeness is recorded either
+    way, as columns ``sweep_id``, ``sweep_expected_runs``, ``sweep_done_runs``
+    (easy for the app: plain ``pd.read_parquet``) and as parquet file metadata
+    under :data:`PUBLISH_METADATA_KEY` (JSON).
+    """
+    progress = sweep_progress(spec, sweep_id, root)
+    if not progress.complete and not allow_partial:
+        raise IncompleteSweep(
+            f"sweep {sweep_id!r}: {progress.done} of {progress.expected} runs are done "
+            f"({progress.queued} in the run store); finish or re-run the rest, "
+            "or publish anyway with --allow-partial"
+        )
     df = summary_rows(spec, sweep_id, root)
     if df.empty:
         raise ValueError(f"sweep {sweep_id!r} has no finished runs to publish")
+    df.insert(2, "sweep_id", sweep_id)
+    df.insert(3, "sweep_expected_runs", progress.expected)
+    df.insert(4, "sweep_done_runs", progress.done)
+    table = pa.Table.from_pandas(df, preserve_index=False)
+    info = {
+        "sweep": spec.name,
+        "sweep_id": sweep_id,
+        "expected_runs": progress.expected,
+        "done_runs": progress.done,
+        "partial": not progress.complete,
+    }
+    table = table.replace_schema_metadata(
+        {**(table.schema.metadata or {}), PUBLISH_METADATA_KEY: json.dumps(info).encode()}
+    )
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     path = out / f"{runs.slugify(spec.name)}{PUBLISHED_SUFFIX}"
@@ -303,7 +366,7 @@ def publish(
     fd, tmp = tempfile.mkstemp(dir=out, prefix=f".{path.name}.", suffix=".tmp")
     os.close(fd)
     try:
-        df.to_parquet(tmp, index=False)
+        pq.write_table(table, tmp)
         os.replace(tmp, path)
     except BaseException:
         Path(tmp).unlink(missing_ok=True)
@@ -311,16 +374,33 @@ def publish(
     return path
 
 
+def read_publish_info(path: Path | str) -> dict[str, Any] | None:
+    """The completeness record of a published summary (``None`` for older files)."""
+    meta = pq.read_schema(path).metadata or {}
+    raw = meta.get(PUBLISH_METADATA_KEY)
+    return json.loads(raw) if raw else None
+
+
 def latest_sweep_id(name: str, root: Path | str | None = None) -> str | None:
-    """The most recent ``sweep_id`` created for sweep ``name`` (for ``--publish`` alone)."""
-    prefix = f"{runs.slugify(name)}-"
-    ids = sorted(
-        {s.sweep_id for s in runs.list_runs(root) if s.sweep_id and s.sweep_id.startswith(prefix)}
-    )
-    return ids[-1] if ids else None
+    """The most recent ``sweep_id`` created for sweep ``name`` (for ``--publish-only``).
+
+    Matches ``<slug>-YYYYMMDD-HHMMSS`` exactly, so sweep ``optimiser_eval``
+    never picks up an execution of ``optimiser_eval_fast`` (a plain prefix
+    match would: both slugs start ``optimiser-eval-``), and sorts by the
+    timestamp part.
+    """
+    pattern = re.compile(rf"^{re.escape(runs.slugify(name))}-(\d{{8}}-\d{{6}})$")
+    stamped = {
+        (m.group(1), s.sweep_id)
+        for s in runs.list_runs(root)
+        if s.sweep_id and (m := pattern.match(s.sweep_id))
+    }
+    return max(stamped)[1] if stamped else None
 
 
 __all__: Sequence[str] = (
+    "IncompleteSweep",
+    "SweepProgress",
     "SweepRun",
     "SweepSpec",
     "apply_links",
@@ -331,5 +411,7 @@ __all__: Sequence[str] = (
     "parse_sweep",
     "publish",
     "queue_sweep",
+    "read_publish_info",
+    "sweep_progress",
     "summary_rows",
 )

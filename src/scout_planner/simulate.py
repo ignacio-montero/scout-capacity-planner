@@ -69,9 +69,17 @@ One day, in order
 
    When a desk review finishes with automation on and
    ``request.needs_rework(rework_rate)``, the pre-screen output was unusable:
-   the same scout continues with the full original desk hours + the overhead
-   (still the desk step, so the write-up stays blocked). A finished task
-   unlocks its dependants for the next assignment run.
+   the same scout continues until the desk review has cost the **full
+   original desk hours + the overhead in total** (the reduced hours already
+   spent count towards it), still as the desk step, so the write-up stays
+   blocked. This is the same model the plan uses
+   (``forecast.automation_factor``); a test pins the two together. A
+   finished task unlocks its dependants for the next assignment run.
+
+``assignment.unit = bundle`` (desk review + write-up for one scout,
+back-to-back): the bundle depends on the live view, because its write-up
+does, so in bundle mode the desk review also waits for the live view
+(known limitation, D-021). ``task`` mode (the default) does not have it.
 
 Assignment happens before execution, so work committed this morning can be
 done today, and a request received today can start today. A live view is
@@ -603,6 +611,10 @@ class _Simulation:
             self.diag["fallbacks"] += int(solve.fell_back_to_edf)
             self.diag["solve_seconds_total"] += solve.wall_time_s
             self.diag["solve_seconds_max"] = max(self.diag["solve_seconds_max"], solve.wall_time_s)
+            # CP-SAT status per solve (OPTIMAL / FEASIBLE / UNKNOWN...): how often
+            # the time limit stopped the search before a proof.
+            key = f"status_{solve.status}"
+            self.diag[key] = self.diag.get(key, 0) + 1
 
         chosen = {a.item_id: a.scout_id for a in outcome.assignments}
         for w in pool:
@@ -642,7 +654,12 @@ class _Simulation:
             request = self.requests[task.request_id].request
             if request.needs_rework(self.rework_rate):
                 task.rework_done = True
-                task.remaining = task.base_desk_hours + self.params.automation.rework_overhead_hours
+                # Total desk effort of a failed pre-screen = full desk + overhead
+                # (forecast.automation_factor); the reduced hours already spent count.
+                spent = task.base_desk_hours * self.desk_factor
+                task.remaining = (
+                    task.base_desk_hours + self.params.automation.rework_overhead_hours - spent
+                )
                 self.diag["reworks"] += 1
                 if task.remaining > EPS:
                     return False
@@ -689,6 +706,9 @@ class _Simulation:
 
             # c. the queue: started work first, then earliest due first
             for item in sorted((i for i in queue if i.kind != "live"), key=self._queue_order):
+                # Cheap guard: the pool builder only offers ready items, so a
+                # queued item's prerequisites (outside the item) are all done.
+                assert all(self.tasks[t].done for t in item.depends_on_tasks), item.item_id
                 for tid in item.task_ids:
                     task = self.tasks[tid]
                     while not task.done and avail > EPS:

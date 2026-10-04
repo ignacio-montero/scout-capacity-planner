@@ -57,6 +57,7 @@ import math
 from collections import Counter, defaultdict
 from collections.abc import Iterable, Sequence
 
+from scout_planner.config import AssignmentParams
 from scout_planner.domain import Assignment, AssignmentWindow, ScoutState, WorkItem
 
 # One float tolerance for every hour comparison in this package, in hours
@@ -74,6 +75,9 @@ def scaled_hours(hours: float) -> int:
 def scaled_capacity(hours: float) -> int:
     """Capacity in hundredths of an hour, rounded down (never over-count hours)."""
     return math.floor(hours * HOURS_SCALE + EPS * HOURS_SCALE)
+
+
+RUN_INTERVAL_DAYS = {"daily": 1, "weekly": 7}  # days until the next assignment run
 
 
 # --- input checks ------------------------------------------------------------------
@@ -203,6 +207,72 @@ def deadline_index(
         if free[j] >= need:
             return j
     return None
+
+
+def commit_index(window: AssignmentWindow, cfg: AssignmentParams) -> int | None:
+    """Last window-day index by which committed non-live work must be finished.
+
+    ``assignment.commit_buffer_days`` days after the next run (daily cadence,
+    buffer 2: by the end of the day after tomorrow); ``None`` = the whole window.
+    Used by the optimiser and by ``edf_feasible`` (same feasibility rules).
+
+    Why: the model plans a week, but nothing is gained by *committing* work
+    that will only start in five days; tomorrow's run sees more (new
+    arrivals, finished work, rework) and can still place it. Committing the
+    whole window also made the optimiser indifferent between starting a desk
+    review today and on day 6 (both "finish by the due date"), so it parked
+    work late and lost the buffer the write-up needed (M3 calibration). This
+    is the standard rolling-horizon rule: plan over the horizon, commit only
+    the first period (*frozen zone* / *commitment horizon*).
+    """
+    if cfg.commit_buffer_days is None:
+        return None
+    return RUN_INTERVAL_DAYS[cfg.cadence] - 1 + cfg.commit_buffer_days
+
+
+class DueDateLedger:
+    """Running due-date capacity check, scout by scout, as items are added one at a time.
+
+    The same rule as the optimiser's constraints and :func:`due_date_violations`
+    (scaled integer hours, frozen work first, deadlines from
+    :func:`deadline_index` with the optional commitment horizon), so a greedy
+    answer built through it is feasible in the CP-SAT model too.
+    """
+
+    def __init__(
+        self,
+        scouts: Sequence[ScoutState],
+        window: AssignmentWindow,
+        commit_by: int | None = None,
+    ) -> None:
+        self.window = window
+        self.commit_by = commit_by
+        self.free = {s.scout_id: free_by_day(s, window) for s in scouts}
+        self.due_units = {sid: [0] * window.n_days for sid in self.free}
+
+    def deadline(self, item: WorkItem, scout_id: str) -> int | None:
+        """The item's deadline day index for this scout (``None``: never fits)."""
+        return deadline_index(item, self.free[scout_id], self.window, commit_by=self.commit_by)
+
+    def fits(self, item: WorkItem, scout_id: str) -> bool:
+        """Whether the scout can still finish everything by its deadline with this item added."""
+        j = self.deadline(item, scout_id)
+        if j is None:
+            return False
+        trial = self.due_units[scout_id].copy()
+        trial[j] += scaled_hours(item.hours)
+        running = 0
+        for k, free in enumerate(self.free[scout_id]):
+            running += trial[k]
+            if running > free:
+                return False
+        return True
+
+    def add(self, item: WorkItem, scout_id: str) -> None:
+        """Record the item on the scout (call only after :meth:`fits` said yes)."""
+        j = self.deadline(item, scout_id)
+        assert j is not None
+        self.due_units[scout_id][j] += scaled_hours(item.hours)
 
 
 def due_date_violations(

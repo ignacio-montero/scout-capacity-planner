@@ -1,10 +1,10 @@
 # The cost of forecast error (D-014): 4x arrives, the agency hired for 2x
-# (under), 4x (right) or 6x (over). 3 x 2 = 6 runs x 3 seeds.
+# (under), 4x (right) or 6x (over). 3 x 3 = 9 runs x 3 seeds.
 name: forecast_error
 base: config/default.yaml
 vary:
   capacity_plan.assumed_growth: [2.0, 4.0, 6.0]
-  assignment.policy: [edf, optimiser]
+  assignment.policy: [edf, edf_feasible, optimiser]
 fixed:
   demand.actual_growth: 4.0
   sim.seeds: 3

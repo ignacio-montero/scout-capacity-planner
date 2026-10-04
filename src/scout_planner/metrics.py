@@ -75,12 +75,15 @@ SEED_EXTRAS: tuple[str, ...] = (
     "optimiser_solves",
     "wall_clock_hits",
     "fallbacks",
+    "fallback_share",
+    "wall_clock_share",
     "mean_solve_seconds",
     "max_solve_seconds",
     "live_view_retargets",
     "reworks",
     "sim_seconds",
 )
+STATUS_PREFIX = "status_"  # + CP-SAT status name: solves that ended with that status
 INT_COLUMNS = frozenset(
     {
         "seed",
@@ -107,6 +110,8 @@ DIAGNOSTIC_KEYS: tuple[str, ...] = (
     "optimiser_solves",
     "wall_clock_hits",
     "fallbacks",
+    "fallback_share",
+    "wall_clock_share",
     "mean_solve_seconds",
     "max_solve_seconds",
     "live_view_retargets",
@@ -208,21 +213,28 @@ def seed_row(result: ReplicationResult, params: Params) -> dict[str, Any]:
         "optimiser_solves": int(solves),
         "wall_clock_hits": int(d.get("wall_clock_hits", 0)),
         "fallbacks": int(d.get("fallbacks", 0)),
+        "fallback_share": _ratio(d.get("fallbacks", 0), solves) if solves else 0.0,
+        "wall_clock_share": _ratio(d.get("wall_clock_hits", 0), solves) if solves else 0.0,
         "mean_solve_seconds": _ratio(d.get("solve_seconds_total", 0.0), solves) if solves else 0.0,
         "max_solve_seconds": float(d.get("solve_seconds_max", 0.0)),
         "live_view_retargets": int(d.get("live_view_retargets", 0)),
         "reworks": int(d.get("reworks", 0)),
         "sim_seconds": float(d.get("sim_seconds", 0.0)),
     }
+    for key in sorted(k for k in d if k.startswith(STATUS_PREFIX)):
+        row[key] = int(d[key])
     return row
 
 
 def seeds_frame(results: Sequence[ReplicationResult], params: Params) -> pd.DataFrame:
     """``seeds.parquet``: one row per replication, contract columns first."""
     rows = [seed_row(r, params) for r in sorted(results, key=lambda r: r.replication)]
-    df = pd.DataFrame(rows, columns=["seed", *SEED_METRICS, *SEED_EXTRAS])
+    statuses = sorted({k for row in rows for k in row if k.startswith(STATUS_PREFIX)})
+    df = pd.DataFrame(rows, columns=["seed", *SEED_METRICS, *SEED_EXTRAS, *statuses])
+    df[statuses] = df[statuses].fillna(0)  # a status one replication never hit
     for col in df.columns:
-        df[col] = df[col].astype("int64" if col in INT_COLUMNS else "float64")
+        is_int = col in INT_COLUMNS or col.startswith(STATUS_PREFIX)
+        df[col] = df[col].astype("int64" if is_int else "float64")
     return df
 
 
@@ -279,6 +291,11 @@ def summarise(seeds: pd.DataFrame, params: Params) -> dict[str, Any]:
     totals: dict[str, Any] = {}
     for key in ("assignment_runs", "optimiser_solves", "wall_clock_hits", "fallbacks"):
         totals[key] = int(seeds[key].sum())
+    n_solves = totals["optimiser_solves"]
+    totals["fallback_share"] = totals["fallbacks"] / n_solves if n_solves else 0.0
+    totals["wall_clock_share"] = totals["wall_clock_hits"] / n_solves if n_solves else 0.0
+    for col in (c for c in seeds.columns if c.startswith(STATUS_PREFIX)):
+        totals[col] = int(seeds[col].sum())
     solves = seeds["optimiser_solves"].to_numpy(dtype=float)
     mean_s = seeds["mean_solve_seconds"].to_numpy(dtype=float)
     totals["mean_solve_seconds"] = (
@@ -287,8 +304,9 @@ def summarise(seeds: pd.DataFrame, params: Params) -> dict[str, Any]:
     totals["max_solve_seconds"] = float(seeds["max_solve_seconds"].max())
     totals["live_view_retargets"] = int(seeds["live_view_retargets"].sum())
     totals["reworks"] = int(seeds["reworks"].sum())
+    status_cols = [c for c in seeds.columns if c.startswith(STATUS_PREFIX)]
     totals["per_seed"] = [
-        {k: _json_value(row[k]) for k in ("seed", *DIAGNOSTIC_KEYS)}
+        {k: _json_value(row[k]) for k in ("seed", *DIAGNOSTIC_KEYS, *status_cols)}
         for row in seeds.to_dict("records")
     ]
     out["diagnostics"] = totals
@@ -303,12 +321,29 @@ def _json_value(v: Any) -> Any:
     return v
 
 
+DIAG_PREFIX = "diag_"
+
+
 def flatten_summary(summary: Mapping[str, Any]) -> dict[str, Any]:
-    """``{"on_time_rate_mean": .., "on_time_rate_min": .., ..., "meets_target": ..}`` (G5)."""
+    """One flat row for a published sweep table (G5).
+
+    ``{"on_time_rate_mean": .., "on_time_rate_min": .., ..., "meets_target": ..}``
+    plus every scalar in the ``diagnostics`` block as ``diag_<key>``
+    (``diag_optimiser_solves``, ``diag_fallbacks``, ``diag_fallback_share``,
+    ``diag_wall_clock_hits``, ``diag_status_FEASIBLE``...: whatever keys the
+    run recorded), so a sweep table shows which runs' optimiser answers were
+    partly EDF fallbacks or stopped by the clock. ``per_seed`` stays in
+    ``summary.json``.
+    """
     flat: dict[str, Any] = {}
     for name, entry in summary.items():
         if isinstance(entry, Mapping) and {"mean", "min", "max"} <= set(entry):
             for stat in ("mean", "min", "max"):
                 flat[f"{name}_{stat}"] = entry[stat]
     flat["meets_target"] = bool(summary.get("meets_target", False))
+    diagnostics = summary.get("diagnostics")
+    if isinstance(diagnostics, Mapping):
+        for key, value in diagnostics.items():
+            if isinstance(value, bool | int | float) or value is None:
+                flat[f"{DIAG_PREFIX}{key}"] = value
     return flat

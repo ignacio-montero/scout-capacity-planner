@@ -1,10 +1,12 @@
-"""Assignment policies (FCFS, EDF, CP-SAT optimiser) behind a common interface.
+"""Assignment policies (FCFS, EDF, EDF + due-date check, CP-SAT) behind one interface.
 
-This is the *strategy pattern*: every policy is a function with the same
-signature (:class:`Policy`, spec in ``docs/DATA_CONTRACTS.md`` section 4), and
-callers look one up by name instead of importing it. The simulation only ever
-calls :func:`assign` / :func:`assign_with_report` (or :func:`get_policy`), so
-adding a fourth policy means adding one entry to :data:`POLICIES`.
+Four policies: ``fcfs``, ``edf``, ``edf_feasible`` (EDF + due-date check,
+the strong baseline) and ``optimiser``. This is the *strategy pattern*: every
+policy is a function with the same signature (:class:`Policy`, spec in
+``docs/DATA_CONTRACTS.md`` section 4), and callers look one up by name instead
+of importing it. The simulation only ever calls :func:`assign` /
+:func:`assign_with_report` (or :func:`get_policy`), so adding another policy
+means adding one entry to :data:`POLICIES`.
 
 All policies share the hard constraints in :mod:`.eligibility`;
 :func:`~.eligibility.validate_assignments` checks any policy's answer.
@@ -20,7 +22,7 @@ from typing import Protocol
 import numpy as np
 
 from scout_planner.assign.eligibility import validate_assignments
-from scout_planner.assign.greedy import edf, fcfs
+from scout_planner.assign.greedy import edf, edf_feasible, fcfs
 from scout_planner.assign.optimiser import SolveReport, solve_assignment
 from scout_planner.assign.optimiser import optimiser as cp_sat_optimiser
 from scout_planner.config import AssignmentParams, CostParams
@@ -62,7 +64,7 @@ class Policy(Protocol):
 # this package, so ``from scout_planner.assign import optimiser`` would return the
 # function instead of the module.
 POLICIES: Mapping[str, Policy] = MappingProxyType(
-    {"fcfs": fcfs, "edf": edf, "optimiser": cp_sat_optimiser}
+    {"fcfs": fcfs, "edf": edf, "edf_feasible": edf_feasible, "optimiser": cp_sat_optimiser}
 )
 
 # Policies that can also say *how* they decided (solver status, time, fallback).
@@ -103,6 +105,11 @@ class AssignOutcome:
 
     assignments: list[Assignment]
     solve: SolveReport | None = None
+
+    @property
+    def diagnostics(self) -> dict[str, float]:
+        """Additive solver counters for this run (see ``SolveReport.counters``); ``{}`` if none."""
+        return {} if self.solve is None else self.solve.counters()
 
 
 def assign_with_report(

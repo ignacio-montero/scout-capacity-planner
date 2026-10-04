@@ -1,0 +1,20 @@
+# How much does the answer depend on the price of a late report, the single
+# most answer-shaping number (PARAMETERS: cost.late_penalty)? 4x growth that
+# the agency plans for (assumed = actual), the plan's hiring rule at P80, the
+# pre-screen tool on. The optimiser prices lateness with this number; EDF and
+# EDF-feasible ignore it, so their on-time rate should not move while their
+# total cost does. 3 x 3 = 9 runs x 3 seeds.
+name: late_penalty
+base: config/default.yaml
+vary:
+  cost.late_penalty: [250.0, 1000.0, 4000.0]
+  assignment.policy: [edf, edf_feasible, optimiser]
+fixed:
+  demand.actual_growth: 4.0
+  capacity_plan.hire_mix: rule
+  capacity_plan.quantile: 0.8
+  automation.enabled: true
+  sim.seeds: 3
+  assignment.time_limit_s: 0.3
+link:
+  capacity_plan.assumed_growth: demand.actual_growth

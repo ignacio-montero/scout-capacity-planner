@@ -161,7 +161,7 @@ def test_published_listing_and_loading(demo) -> None:
 def test_normalise_fills_unvaried_parameters_with_defaults() -> None:
     df = pd.DataFrame({"on_time_rate_mean": [0.9, 0.97], "cost_total_mean": [1.0, 2.0]})
     out = normalise_sweep_frame(df, DEFAULTS)
-    assert out["policy"].tolist() == ["optimiser", "optimiser"]
+    assert out["policy"].tolist() == [DEFAULTS.assignment.policy] * 2
     assert out["meets_target"].tolist() == [False, True]
     assert out["on_time_rate_min"].tolist() == [0.9, 0.97]
 

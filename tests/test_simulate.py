@@ -142,7 +142,7 @@ def test_task_hours_are_conserved(traced) -> None:
         assert done[rid, "writeup"] == pytest.approx(r["writeup_hours"])
         desk = r["desk_hours"] * factor
         if auto.enabled and r["rework_draw"] < auto.rework_rate:
-            desk += r["desk_hours"] + auto.rework_overhead_hours
+            desk = r["desk_hours"] + auto.rework_overhead_hours  # full desk + overhead in total
         assert done[rid, "desk"] == pytest.approx(desk)
 
 
@@ -300,7 +300,8 @@ def test_rework_continues_with_the_same_scout() -> None:
     reqs = [request("R1", D(2027, 1, 4), desk=6.0, rework_draw=0.1)]
     result = simulate.simulate_replication(hand_inputs(params, [scout("S1")], reqs), trace=True)
     desk = result.work_log[result.work_log["kind"] == "desk"]
-    assert desk["hours"].sum() == pytest.approx(3.0 + 6.0 + 1.0)
+    # 3 h with the tool, then topped up to the full 6 h + 1 h overhead in total.
+    assert desk["hours"].sum() == pytest.approx(6.0 + 1.0)
     assert desk["scout_id"].nunique() == 1
     assert result.diagnostics["reworks"] == 1
     wu_start = result.work_log.loc[result.work_log["kind"] == "writeup", "date"].min()
@@ -403,3 +404,89 @@ def test_automation_without_rework_beats_automation_off() -> None:
     off = _mean_on_time(tiny_params(**base))
     on = _mean_on_time(tiny_params(**base, automation__enabled=True, automation__rework_rate=0.0))
     assert on > off
+
+
+def test_simulated_desk_effort_matches_the_plans_automation_model() -> None:
+    """Cross-module consistency (B1): the simulation and the capacity plan must agree
+    on what the pre-screen tool costs, or the plan hires for a different world.
+
+    Plan (``forecast.automation_factor``): expected desk hours = E[D] x factor, where a
+    failed pre-screen costs the full desk review + overhead in total. Checked per
+    request (exact) and on average over a simulated default year (noise tolerance).
+    """
+    from scout_planner import forecast
+    from scout_planner.config import apply_overrides, load_default_params
+
+    params = apply_overrides(
+        load_default_params(),
+        {"assignment.policy": "edf", "sim.seeds": 1, "automation.enabled": True,
+         "automation.rework_rate": 0.3, "automation.rework_overhead_hours": 2.0,
+         "team.follow_hiring_plan": False, "demand.actual_growth": 1.0},
+    )  # fmt: skip
+    auto = params.automation
+    result = run_world(params, 0)
+    world = simulate.replication_world(params, 0)
+    req = world.requests.set_index("request_id")
+    log = result.work_log
+    desk_done = set(log.loc[(log["kind"] == "writeup"), "request_id"])  # desk finished
+    spent = log[log["kind"] == "desk"].groupby("request_id")["hours"].sum().loc[sorted(desk_done)]
+    assert len(spent) > 2000
+
+    d = req.loc[spent.index, "desk_hours"]
+    failed = req.loc[spent.index, "rework_draw"] < auto.rework_rate
+    exact = np.where(failed, d + auto.rework_overhead_hours, d * (1 - auto.desk_reduction))
+    np.testing.assert_allclose(spent.to_numpy(), exact, atol=1e-6)
+
+    planned = float(np.mean(params.demand.desk_hours)) * forecast.automation_factor(params)
+    assert spent.mean() == pytest.approx(planned, rel=0.03)
+
+
+def test_salaried_cost_is_pro_rata_for_a_mid_year_hire_in_a_simulated_run() -> None:
+    from scout_planner import metrics
+
+    params = hand_params(sim__months=3)
+    team = [scout("S1"), scout("H1", joined_month=2), scout("F1", "freelance")]
+    reqs = [request("R1", D(2027, 1, 4))]
+    result = simulate.simulate_replication(hand_inputs(params, team, reqs))
+    row = metrics.seed_row(result, params)
+    assert row["cost_salaried"] == 4500.0 * 3 + 4500.0 * 1  # hire paid from month 2 only
+    assert row["n_hires_full_time"] == 1
+    offered = result.scouts.set_index("scout_id")["hours_offered"]
+    assert offered["H1"] == pytest.approx(7.5 * 23)  # March 2027 has 23 weekdays
+
+
+def test_large_pool_fallbacks_are_counted_and_reported(monkeypatch) -> None:
+    """Optimiser falling back to EDF on big pools must be visible per run, not hidden."""
+    from scout_planner import metrics
+    from scout_planner.assign import AssignOutcome, SolveReport
+
+    real = simulate.assign_with_report
+    big = 40
+
+    def fake(pool, scouts, window, cfg, rng, *, cost):
+        outcome = real(pool, scouts, window, cfg, rng, cost=cost)
+        fell_back = len(pool) >= big
+        report = SolveReport(
+            outcome.assignments, "UNKNOWN" if fell_back else "OPTIMAL", None, None, None,
+            0.01, 0.01, fell_back_to_edf=fell_back,
+        )  # fmt: skip
+        return AssignOutcome(outcome.assignments, report)
+
+    pool_sizes = []
+    monkeypatch.setattr(
+        simulate, "assign_with_report",
+        lambda pool, *a, **k: (pool_sizes.append(len(pool)), fake(pool, *a, **k))[1],
+    )  # fmt: skip
+    params = tiny_params(sim__months=1)
+    result = run_world(params, 0, trace=False)
+    n_big = sum(n >= big for n in pool_sizes)
+    assert 0 < n_big < len(pool_sizes)
+    d = result.diagnostics
+    assert d["fallbacks"] == n_big and d["status_UNKNOWN"] == n_big
+    seeds = metrics.seeds_frame([result], params)
+    assert seeds.loc[0, "fallback_share"] == pytest.approx(n_big / len(pool_sizes))
+    summary = metrics.summarise(seeds, params)
+    assert summary["diagnostics"]["status_UNKNOWN"] == n_big
+    flat = metrics.flatten_summary(summary)
+    assert flat["diag_fallback_share"] == pytest.approx(n_big / len(pool_sizes))
+    assert flat["diag_status_OPTIMAL"] == len(pool_sizes) - n_big
