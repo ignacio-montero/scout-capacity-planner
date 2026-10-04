@@ -22,7 +22,14 @@ from plotly.subplots import make_subplots
 
 from scout_planner import charts
 from scout_planner.config import Params
-from scout_planner.formatting import fmt_cost_k, fmt_growth, fmt_money, fmt_pct, fmt_pct_near
+from scout_planner.formatting import (
+    fmt_cost_k,
+    fmt_growth,
+    fmt_money,
+    fmt_pct,
+    fmt_pct_near,
+    fmt_pts,
+)
 from scout_planner.results import flatten_params, normalise_sweep_frame
 
 # Parameters the README charts group by; a published file only has a column
@@ -696,6 +703,351 @@ def fig_late_penalty(df: pd.DataFrame, target: float) -> go.Figure:
     return _finish(fig, title_late_penalty(df, target), subtitle, footnote("late_penalty", df))
 
 
+# --- 8. paired comparison vs FCFS (the case study) -----------------------------------------
+
+# A "setting" is everything but the assignment rule. Within a setting every rule
+# sees the same requests, team and hiring plan (common random numbers, D-015),
+# so the difference between two rules is the effect of the rule alone.
+SETTING_KEYS: tuple[str, ...] = (
+    "capacity_plan.hire_mix",
+    "capacity_plan.quantile",
+    "automation_enabled",
+)
+BASE_POLICY = "fcfs"
+
+
+def setting_label(row: Mapping[str, Any]) -> str:
+    """``"Planned mix · P80 · tool on"``."""
+    mix = mix_label(str(row["capacity_plan.hire_mix"]))
+    quantile = f"P{round(float(row['capacity_plan.quantile']) * 100)}"
+    tool = "tool on" if bool(row["automation_enabled"]) else "tool off"
+    return f"{mix} · {quantile} · {tool}"
+
+
+def paired_frame(df: pd.DataFrame, base: str = BASE_POLICY) -> pd.DataFrame:
+    """One row per (setting, challenger policy) next to the ``base`` policy's result.
+
+    Columns: the setting keys, ``setting``, ``policy``, ``base_on_time``,
+    ``on_time``, ``gain`` (fraction; x100 = pts), ``base_cost``, ``cost``,
+    ``cost_change`` (fraction of the base cost), ``better_both`` (more on time
+    *and* cheaper), ``meets``, ``base_meets``. Settings without a base row are dropped.
+    """
+    keys = list(SETTING_KEYS)
+    cols = [*keys, "policy", "on_time_rate_mean", "cost_total_mean", "meets_target"]
+    base_rows = df[df["policy"] == base][cols].drop(columns="policy")
+    base_rows = base_rows.rename(
+        columns={
+            "on_time_rate_mean": "base_on_time",
+            "cost_total_mean": "base_cost",
+            "meets_target": "base_meets",
+        }
+    )
+    others = df[df["policy"] != base][cols].rename(
+        columns={"on_time_rate_mean": "on_time", "cost_total_mean": "cost", "meets_target": "meets"}
+    )
+    out = others.merge(base_rows, on=keys, how="inner")
+    out["gain"] = out["on_time"] - out["base_on_time"]
+    out["cost_change"] = out["cost"] / out["base_cost"] - 1
+    out["better_both"] = (out["gain"] > 0) & (out["cost_change"] < 0)
+    out["setting"] = [setting_label(r) for r in out.to_dict("records")]
+    order = {p: i for i, p in enumerate(charts.POLICY_ORDER)}
+    return out.sort_values(
+        ["policy", "base_on_time"], key=lambda s: s.map(order) if s.name == "policy" else s
+    ).reset_index(drop=True)
+
+
+def paired_stats(pairs: pd.DataFrame) -> pd.DataFrame:
+    """Per challenger policy: gain and cost-change summary and the "better on both" count."""
+    rows = []
+    for policy in charts.ordered_policies(pairs["policy"].unique().tolist()):
+        p = pairs[pairs["policy"] == policy]
+        rows.append(
+            {
+                "policy": policy,
+                "n": len(p),
+                "gain_mean": p["gain"].mean(),
+                "gain_median": p["gain"].median(),
+                "gain_min": p["gain"].min(),
+                "gain_max": p["gain"].max(),
+                "cost_mean": p["cost_change"].mean(),
+                "cost_median": p["cost_change"].median(),
+                "cost_min": p["cost_change"].min(),
+                "cost_max": p["cost_change"].max(),
+                "better_both": int(p["better_both"].sum()),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def gain_correlation(pairs: pd.DataFrame, policy: str = "optimiser") -> float | None:
+    """Pearson correlation between a policy's gain and the base on-time rate.
+
+    Strongly negative = the tighter the operation (lower FCFS on-time), the
+    larger the gain. None with fewer than 3 settings.
+    """
+    p = pairs[pairs["policy"] == policy]
+    if len(p) < 3 or p["gain"].std() == 0 or p["base_on_time"].std() == 0:
+        return None
+    return float(p["gain"].corr(p["base_on_time"]))
+
+
+def _signed_pct(fraction: float) -> str:
+    return f"{fraction * 100:+.1f}%"
+
+
+def title_policy_gain(pairs: pd.DataFrame, policy: str = "optimiser") -> str:
+    p = pairs[pairs["policy"] == policy]
+    if p.empty:
+        return "Assignment rules compared with first come, first served"
+    name = charts.policy_label(policy)
+    best_gain = fmt_pts(float(p["gain"].max()))
+    best_cost = _signed_pct(float(p["cost_change"].min()))
+    corr = gain_correlation(pairs, policy)
+    if corr is not None and corr <= -0.5:
+        return (
+            f"The {name.lower()}'s gain over first come, first served grows as capacity tightens:"
+            f" up to {best_gain} on time and {best_cost} cost"
+        )
+    return f"The {name.lower()} gains up to {best_gain} on time and {best_cost} cost over FCFS"
+
+
+def fig_policy_gain(df: pd.DataFrame, target: float) -> go.Figure:
+    """Gain over FCFS (pts) and cost change (%) against FCFS's own on-time rate."""
+    pairs = paired_frame(df)
+    fig = _two_panels("On-time gain over FCFS", "Total cost change vs FCFS")
+    for policy in charts.ordered_policies(pairs["policy"].unique().tolist()):
+        p = pairs[pairs["policy"] == policy].sort_values("base_on_time")
+        color = charts.policy_color(policy)
+        symbol = charts.POLICY_SYMBOLS.get(policy, "circle")
+        for col, y, fmt in ((1, p["gain"] * 100, "%{y:+.1f} pts"), (2, p["cost_change"] * 100,
+                            "%{y:+.1f}%")):  # fmt: skip
+            fig.add_trace(
+                go.Scatter(
+                    x=p["base_on_time"],
+                    y=y,
+                    mode="markers",
+                    name=charts.policy_label(policy),
+                    legendgroup=policy,
+                    showlegend=col == 1,
+                    marker={
+                        "symbol": [
+                            symbol if tool else f"{symbol}-open" for tool in p["automation_enabled"]
+                        ],
+                        "size": 11,
+                        "color": color,
+                        "line": {"color": color, "width": 2},
+                    },
+                    text=p["setting"],
+                    hovertemplate=f"{charts.policy_label(policy)}<br>%{{text}}<br>FCFS on time "
+                    f"%{{x:.1%}}<br>{fmt}<extra></extra>",
+                ),
+                row=1,
+                col=col,
+            )
+    for col in (1, 2):
+        fig.add_hline(y=0, line={"color": charts.NEUTRAL, "width": 1}, row=1, col=col)
+        fig.add_vline(x=target, line=charts.TARGET_LINE, row=1, col=col)
+    lo, hi = float(pairs["base_on_time"].min()), float(pairs["base_on_time"].max())
+    pad = (max(hi, target) - lo) * 0.05  # keep edge points and the target line inside
+    fig.update_xaxes(
+        title_text="FCFS on-time rate in the same setting (lower = tighter)",
+        tickformat=".0%",
+        range=[lo - pad, max(hi, target) + pad],
+    )  # fmt: skip
+    fig.update_yaxes(title_text="On-time gain (pts)", ticksuffix=" pts", row=1, col=1)
+    fig.update_yaxes(title_text="Total cost change", ticksuffix="%", row=1, col=2)
+    subtitle = (
+        "One point per staffing setting and rule · filled = pre-screen on, hollow = off · "
+        f"dashed line = {fmt_pct(target, 0)} target"
+    )
+    note = (
+        f"Each pair shares the same requests, team and plan · "
+        f"{repeats_of(df) or 3} simulated years each · synthetic data"
+    )
+    return _finish(fig, title_policy_gain(pairs), subtitle, note)
+
+
+def title_paired(pairs: pd.DataFrame, policy: str = "optimiser") -> str:
+    p = pairs[pairs["policy"] == policy]
+    if p.empty:
+        return "Paired comparison with first come, first served"
+    name = charts.policy_label(policy)
+    return (
+        f"{name} beats first come, first served on both on-time and cost in "
+        f"{int(p['better_both'].sum())} of {len(p)} staffing settings"
+    )
+
+
+def fig_paired(df: pd.DataFrame, target: float) -> go.Figure:
+    """Dumbbells per setting: FCFS -> optimiser (and EDF + due-date check), on-time and cost."""
+    pairs = paired_frame(df)
+    opt = pairs[pairs["policy"] == "optimiser"].sort_values("base_on_time")
+    order = opt["setting"].tolist()
+    fig = make_subplots(
+        rows=1,
+        cols=2,
+        shared_yaxes=True,
+        horizontal_spacing=0.04,
+        subplot_titles=["On-time rate", "Total cost for the year"],
+    )
+    for col, base_col, val_col, scale in (
+        (1, "base_on_time", "on_time", 1.0),
+        (2, "base_cost", "cost", 1000.0),
+    ):
+        # connector FCFS -> optimiser, one segment per setting (None breaks the line)
+        xs: list[Any] = []
+        ys: list[Any] = []
+        for _, r in opt.iterrows():
+            xs += [r[base_col] / scale, r[val_col] / scale, None]
+            ys += [r["setting"], r["setting"], None]
+        fig.add_trace(
+            go.Scatter(
+                x=xs,
+                y=ys,
+                mode="lines",
+                line={"color": charts.NEUTRAL, "width": 1.5},
+                hoverinfo="skip",
+                showlegend=False,
+            ),
+            row=1,
+            col=col,
+        )
+        base_points = opt[["setting", base_col]].rename(columns={base_col: "value"})
+        series = [("fcfs", base_points)]
+        for policy in ("edf_feasible", "optimiser"):
+            part = pairs[pairs["policy"] == policy][["setting", val_col]]
+            series.append((policy, part.rename(columns={val_col: "value"})))
+        for policy, part in series:
+            if part.empty:
+                continue
+            fig.add_trace(
+                go.Scatter(
+                    x=part["value"] / scale,
+                    y=part["setting"],
+                    mode="markers",
+                    name=charts.policy_label(policy),
+                    legendgroup=policy,
+                    showlegend=col == 1,
+                    marker={
+                        "symbol": charts.POLICY_SYMBOLS.get(policy, "circle"),
+                        "size": 11 if policy != "edf_feasible" else 8,
+                        "color": charts.policy_color(policy),
+                    },
+                    hovertemplate=f"{charts.policy_label(policy)}<br>%{{y}}<br>"
+                    + ("%{x:.1%}" if col == 1 else "%{x:,.0f}k")
+                    + "<extra></extra>",
+                ),
+                row=1,
+                col=col,
+            )
+    fig.add_vline(
+        x=target,
+        line=charts.TARGET_LINE,
+        annotation_text=f"{fmt_pct(target, 0)} target",
+        annotation_position="bottom right",
+        annotation_font={"size": 12, "color": charts.NEUTRAL},
+        row=1,
+        col=1,
+    )
+    fig.update_yaxes(categoryorder="array", categoryarray=order, automargin=True)
+    fig.update_xaxes(tickformat=".0%", title_text="On-time rate", row=1, col=1)
+    fig.update_xaxes(ticksuffix="k", tickformat=",.0f", title_text="Total cost (k)", row=1, col=2)
+    subtitle = (
+        "Each row is one staffing setting, sorted by FCFS on-time (tightest at the bottom) · "
+        "the grey bar joins FCFS to the optimiser"
+    )
+    note = (
+        f"Same requests, team and plan in every row · {repeats_of(df) or 3} simulated years "
+        "each · synthetic data"
+    )
+    return _finish(fig, title_paired(pairs), subtitle, note)
+
+
+def paired_markdown(df: pd.DataFrame, target: float) -> str:
+    """The "Paired comparison vs FCFS" section of key_numbers.md."""
+    pairs = paired_frame(df)
+    n_settings = pairs["setting"].nunique()
+    out = [f"## Paired comparison vs FCFS (headline, {n_settings} settings)", ""]
+    out += [
+        "Every pair shares the same requests, team and hiring plan (common random numbers), "
+        "so each difference is the effect of the assignment rule alone.",
+        "",
+    ]
+
+    def stats_table(sub: pd.DataFrame) -> str:
+        rows = []
+        for _, s in paired_stats(sub).iterrows():
+            rows.append(
+                [
+                    charts.policy_label(str(s["policy"])),
+                    f"{fmt_pts(s['gain_mean'])} / {fmt_pts(s['gain_median'])} "
+                    f"({fmt_pts(s['gain_min'])} to {fmt_pts(s['gain_max'])})",
+                    f"{_signed_pct(s['cost_mean'])} / {_signed_pct(s['cost_median'])} "
+                    f"({_signed_pct(s['cost_min'])} to {_signed_pct(s['cost_max'])})",
+                    f"{s['better_both']} of {s['n']}",
+                ]
+            )
+        header = [
+            "Rule vs FCFS",
+            "On-time gain: mean / median (min to max)",
+            "Cost change: mean / median (min to max)",
+            "Better on both",
+        ]
+        return _md_table(header, rows)
+
+    out += ["### All settings", "", stats_table(pairs), ""]
+    for tool, label in ((False, "Pre-screen off"), (True, "Pre-screen on")):
+        sub = pairs[pairs["automation_enabled"] == tool]
+        if not sub.empty:
+            out += [f"### {label}", "", stats_table(sub), ""]
+
+    # head-to-head of the two best rules, if both exist
+    if {"edf_feasible", "optimiser"} <= set(df["policy"]):
+        h2h = paired_frame(df, base="edf_feasible")
+        h2h = h2h[h2h["policy"] == "optimiser"]
+        out += [
+            f"Optimiser vs EDF + due-date check: {fmt_pts(h2h['gain'].mean())} on time, "
+            f"{_signed_pct(h2h['cost_change'].mean())} cost on average; better on both in "
+            f"{int(h2h['better_both'].sum())} of {len(h2h)} settings.",
+            "",
+        ]
+
+    rows = []
+    fcfs_best = cheapest_passing_row(df[df["policy"] == BASE_POLICY])
+    for policy in charts.ordered_policies(df["policy"].unique().tolist()):
+        part = df[df["policy"] == policy]
+        best = cheapest_passing_row(part)
+        vs = ""
+        if best is not None and fcfs_best is not None and policy != BASE_POLICY:
+            vs = _signed_pct(best["cost_total_mean"] / fcfs_best["cost_total_mean"] - 1)
+        rows.append(
+            [
+                charts.policy_label(policy),
+                f"{int(part['meets_target'].sum())} of {len(part)}",
+                fmt_cost_k(best["cost_total_mean"]) if best is not None else "none",
+                setting_label(best) if best is not None else "",
+                vs,
+            ]
+        )
+    out += [
+        f"### Settings meeting {fmt_pct(target, 0)} and the cheapest passing setting",
+        "",
+        _md_table(
+            ["Rule", "Settings meeting target", "Cheapest passing", "Which setting", "vs FCFS"],
+            rows,
+        ),
+        "",
+    ]
+    corr = gain_correlation(pairs)
+    if corr is not None:
+        out += [
+            f"Correlation between the optimiser's gain and FCFS's on-time rate: {corr:.2f} "
+            "(negative = the tighter the operation, the bigger the gain).",
+            "",
+        ]
+    return "\n".join(out)
+
+
 # --- key numbers (markdown) -----------------------------------------------------------------
 
 
@@ -794,6 +1146,8 @@ def key_numbers_markdown(frames: Mapping[str, pd.DataFrame | None], defaults: Pa
             ),
             "",
         ]
+    if head is not None and not head.empty and BASE_POLICY in set(head["policy"]):
+        out += [paired_markdown(head, target_of(head, defaults))]
     simple = {
         "growth": ("Growth (planned for exactly)", "actual_growth", fmt_growth, "Growth"),
         "forecast_error": (

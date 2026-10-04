@@ -494,3 +494,108 @@ def test_fallback_note_in_footnote() -> None:
     assert note == "optimiser fell back to EDF in up to 3.2% of rounds (9 of 18 optimiser runs)"
     fig = rc.fig_headline(df, TARGET)
     assert any(note in (a.text or "") for a in fig.layout.annotations)
+
+
+# --- paired comparison vs FCFS (case study) --------------------------------------------------
+
+
+def paired_headline() -> pd.DataFrame:
+    """4 settings x 4 rules with known effects. The tighter the setting (lower FCFS
+    on-time), the bigger the optimiser's gain; in the loosest setting it costs a bit more."""
+    settings = [  # (mix, quantile, tool, fcfs on-time, fcfs cost k)
+        ("freelance_only", 0.5, True, 0.70, 4000),
+        ("freelance_only", 0.8, False, 0.80, 3600),
+        ("rule", 0.8, True, 0.90, 3000),
+        ("rule", 0.9, False, 0.96, 3300),
+    ]
+    effects = {  # rule -> (gain in on-time per setting, cost factor per setting)
+        "edf": ((-0.02, -0.01, 0.0, 0.002), (1.04, 1.02, 1.0, 1.001)),
+        "edf_feasible": ((0.05, 0.04, 0.02, 0.003), (0.93, 0.95, 0.98, 1.002)),
+        "optimiser": ((0.20, 0.13, 0.05, 0.004), (0.72, 0.85, 0.95, 1.01)),
+    }
+    rows = []
+    for i, (mix, q, tool, on_time, cost) in enumerate(settings):
+        params = {"capacity_plan.hire_mix": mix, "capacity_plan.quantile": q,
+                  "automation.enabled": tool, "demand.actual_growth": 4.0}  # fmt: skip
+        rows.append(row(on_time, cost, **{"assignment.policy": "fcfs", **params}))
+        for policy, (gains, factors) in effects.items():
+            rows.append(
+                row(
+                    on_time + gains[i], cost * factors[i], **{"assignment.policy": policy, **params}
+                )
+            )
+    return rc.prepare(pd.DataFrame(rows), DEFAULTS)
+
+
+def test_paired_frame_pairs_each_setting_with_fcfs() -> None:
+    pairs = rc.paired_frame(paired_headline())
+    assert len(pairs) == 12  # 4 settings x 3 challengers
+    assert set(pairs["policy"]) == {"edf", "edf_feasible", "optimiser"}
+    opt = pairs[pairs["policy"] == "optimiser"].set_index("base_on_time")
+    assert opt.loc[0.70, "gain"] == pytest.approx(0.20)
+    assert opt.loc[0.70, "cost_change"] == pytest.approx(-0.28)
+    assert opt.loc[0.70, "setting"] == "Freelancers only · P50 · tool on"
+    assert opt["better_both"].tolist() == [True, True, True, False]  # loosest: costs 1% more
+
+
+def test_paired_stats_and_correlation() -> None:
+    pairs = rc.paired_frame(paired_headline())
+    stats = rc.paired_stats(pairs).set_index("policy")
+    assert list(stats.index) == ["edf", "edf_feasible", "optimiser"]
+    assert stats.loc["optimiser", "gain_max"] == pytest.approx(0.20)
+    assert stats.loc["optimiser", "cost_min"] == pytest.approx(-0.28)
+    assert stats.loc["optimiser", "better_both"] == 3
+    assert stats.loc["edf", "better_both"] == 0
+    assert rc.gain_correlation(pairs) < -0.9  # tighter -> bigger gain
+    assert rc.gain_correlation(pairs.head(2)) is None
+
+
+def test_case_study_titles() -> None:
+    pairs = rc.paired_frame(paired_headline())
+    assert rc.title_policy_gain(pairs) == (
+        "The optimiser's gain over first come, first served grows as capacity tightens: "
+        "up to +20.0 pts on time and -28.0% cost"
+    )
+    flat = pairs.copy()
+    flat.loc[flat["policy"] == "optimiser", "gain"] = [0.01, 0.03, 0.02, 0.04]
+    assert rc.title_policy_gain(flat).startswith("The optimiser gains up to +4.0 pts on time")
+    assert rc.title_paired(pairs) == (
+        "Optimiser beats first come, first served on both on-time and cost in 3 of 4 "
+        "staffing settings"
+    )
+
+
+def test_policy_gain_figure() -> None:
+    fig = rc.fig_policy_gain(paired_headline(), TARGET)
+    assert [t.name for t in fig.data] == [
+        "Earliest deadline first", "Earliest deadline first", "EDF + due-date check",
+        "EDF + due-date check", "Optimiser", "Optimiser",
+    ]  # fmt: skip
+    opt = fig.data[4]
+    assert list(opt.y) == pytest.approx([20.0, 13.0, 5.0, 0.4])  # pts, sorted by FCFS on-time
+    assert list(opt.marker.symbol) == ["diamond", "diamond-open", "diamond", "diamond-open"]
+    assert fig.layout.xaxis.range[0] < 0.70  # tightest setting not clipped
+    assert any("same requests, team and plan" in (a.text or "") for a in fig.layout.annotations)
+
+
+def test_paired_dumbbell_figure() -> None:
+    fig = rc.fig_paired(paired_headline(), TARGET)
+    order = list(fig.layout.yaxis.categoryarray)
+    assert order[0] == "Freelancers only · P50 · tool on"  # tightest first = bottom row
+    names = [t.name for t in fig.data if t.mode == "markers"]
+    assert names[:3] == ["First come, first served", "EDF + due-date check", "Optimiser"]
+    connectors = [t for t in fig.data if t.mode == "lines"]
+    assert len(connectors) == 2 and None in list(connectors[0].x)  # one segment per setting
+    assert any(s.x0 == TARGET for s in fig.layout.shapes)
+
+
+def test_paired_section_in_key_numbers() -> None:
+    text = rc.key_numbers_markdown({"headline": paired_headline()}, DEFAULTS)
+    assert "## Paired comparison vs FCFS (headline, 4 settings)" in text
+    assert "| Optimiser | +9.6 pts / +9.0 pts (+0.4 pts to +20.0 pts) |" in text
+    assert "### Pre-screen off" in text and "### Pre-screen on" in text
+    assert "Optimiser vs EDF + due-date check:" in text
+    assert "Correlation between the optimiser's gain and FCFS's on-time rate: -1.00" in text
+    no_fcfs = paired_headline()
+    no_fcfs = no_fcfs[no_fcfs["policy"] != "fcfs"]
+    assert "Paired comparison" not in rc.key_numbers_markdown({"headline": no_fcfs}, DEFAULTS)

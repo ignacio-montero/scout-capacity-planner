@@ -106,6 +106,10 @@ def chart_specs() -> list[tuple[str, str, Builder]]:
          lambda f, d: rc.fig_baseline(f["baseline"], target(f["baseline"], d))),
         ("cadence.png", "cadence",
          lambda f, d: rc.fig_cadence(f["cadence"], target(f["cadence"], d))),
+        ("policy_gain.png", "headline",
+         lambda f, d: rc.fig_policy_gain(f["headline"], target(f["headline"], d))),
+        ("paired.png", "headline",
+         lambda f, d: rc.fig_paired(f["headline"], target(f["headline"], d))),
         ("late_penalty.png", "late_penalty",
          lambda f, d: rc.fig_late_penalty(f["late_penalty"], target(f["late_penalty"], d))),
     ]  # fmt: skip
