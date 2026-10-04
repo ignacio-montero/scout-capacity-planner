@@ -400,17 +400,19 @@ def test_png_export(tmp_path: Path) -> None:
 
 
 def late_penalty_frame(switch: bool = True) -> pd.DataFrame:
-    """penalty x rule. With ``switch``, EDF is cheapest at 250 and the optimiser at 4,000."""
+    """penalty x rule. EDF is always cheapest but misses the target (94.77%), so it must
+    never be called cheapest. With ``switch``, the cheapest *passing* rule is EDF + due-date
+    check at 250 and the optimiser at 4,000; without it, the optimiser everywhere."""
     rows = []
     for penalty in (250.0, 1000.0, 4000.0):
-        for policy, base, late_reports in (
-            ("edf", 3000, 300),
-            ("edf_feasible", 3050 if switch else 3400, 220),
-            ("optimiser", 3150 if switch else 3700, 150),
+        for policy, base, late_reports, on_time in (
+            ("edf", 2900, 140, 0.9477),
+            ("edf_feasible", 3050 if switch else 3400, 220, 0.9606),
+            ("optimiser", 3150 if switch else 3000, 150, 0.9704),
         ):
             late_cost = late_reports * penalty
             r = row(
-                0.95,
+                on_time,
                 base + late_cost / 1000,
                 **{"assignment.policy": policy, "cost.late_penalty": penalty},
             )
@@ -436,13 +438,20 @@ def test_late_penalty_title_and_cost_excluding_penalty() -> None:
     assert (
         df["cost_excl_penalty_mean"] == df["cost_total_mean"] - df["cost_late_penalty_mean"]
     ).all()
-    assert rc.title_late_penalty(df) == (
-        "The cheapest rule depends on the late penalty: Earliest deadline first at 250, "
-        "Optimiser at 4,000; Earliest deadline first spends least excluding penalties"
+    assert rc.title_late_penalty(df, TARGET) == (
+        "The cheapest rule that meets 95% depends on the late penalty: EDF + due-date check "
+        "at 250, Optimiser at 4,000; among those, EDF + due-date check spends least excluding "
+        "penalties; Earliest deadline first never reaches 95%"
     )
     flat = late_penalty_frame(switch=False)
-    assert rc.title_late_penalty(flat).startswith(
-        "Earliest deadline first is the cheapest rule at every late penalty (250–4,000)"
+    assert rc.title_late_penalty(flat, TARGET) == (
+        "Optimiser is the cheapest rule that meets 95% at every late penalty (250–4,000); "
+        "among those, Optimiser spends least excluding penalties; Earliest deadline first "
+        "never reaches 95%"
+    )
+    none = flat.assign(meets_target=False)
+    assert (
+        rc.title_late_penalty(none, TARGET) == "No rule reaches 95% at any late penalty (250–4,000)"
     )
     fig = rc.fig_late_penalty(df, TARGET)
     assert list(fig.data[0].x) == ["250", "1,000", "4,000"]
@@ -454,7 +463,7 @@ def test_key_numbers_include_cost_excluding_penalty() -> None:
         {"headline": headline_frame(), "late_penalty": late_penalty_frame()}, DEFAULTS
     )
     assert text.count("Cost excl. late penalty") == 2
-    assert "## Late penalty" in text and "The cheapest rule depends on the late penalty" in text
+    assert "## Late penalty" in text and "The cheapest rule that meets 95% depends" in text
 
 
 def test_near_target_values_get_two_decimals_and_worst_repeat_is_named() -> None:
@@ -479,8 +488,8 @@ def test_fallback_note_in_footnote() -> None:
     opt = df["policy"] == "optimiser"
     df.loc[opt & df["automation_enabled"], "fallbacks"] = 12
     assert rc.fallback_note(df) == "optimiser fell back to EDF 108 times (9 of 18 optimiser runs)"
-    df["fallback_share_mean"] = 0.0
-    df.loc[opt & df["automation_enabled"], "fallback_share_mean"] = 0.032
+    df["diag_fallback_share"] = 0.0  # the name the sweep publishes
+    df.loc[opt & df["automation_enabled"], "diag_fallback_share"] = 0.032
     note = rc.fallback_note(df)
     assert note == "optimiser fell back to EDF in up to 3.2% of rounds (9 of 18 optimiser runs)"
     fig = rc.fig_headline(df, TARGET)

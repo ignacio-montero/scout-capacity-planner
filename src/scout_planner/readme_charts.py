@@ -92,8 +92,8 @@ def footnote(sweep: str, df: pd.DataFrame) -> str:
 
 
 def _column(df: pd.DataFrame, name: str) -> pd.Series | None:
-    """A diagnostics column, published plain (``fallbacks``) or flattened (``fallbacks_mean``)."""
-    for candidate in (name, f"{name}_mean"):
+    """A diagnostics column, as published (``diag_fallbacks``), plain or flattened."""
+    for candidate in (f"diag_{name}", name, f"diag_{name}_mean", f"{name}_mean"):
         if candidate in df.columns:
             return pd.to_numeric(df[candidate], errors="coerce")
     return None
@@ -622,30 +622,54 @@ def fig_cadence(df: pd.DataFrame, target: float) -> go.Figure:
 # --- 7. late penalty -------------------------------------------------------------------------
 
 
-def title_late_penalty(df: pd.DataFrame) -> str:
-    """Which rule is cheapest at each penalty level, and which spends least on capacity."""
+def title_late_penalty(df: pd.DataFrame, target: float) -> str:
+    """The cheapest rule **that meets the target** at each penalty level.
+
+    A rule that misses the target is never called "cheapest" (it is cheap
+    because it is late); rules that never pass are named. The "spends least
+    excluding penalties" clause also only considers passing rows.
+    """
     col = "cost.late_penalty"
     levels = sorted(df[col].unique())
-    cheapest = {
-        lvl: df[df[col] == lvl].sort_values(["cost_total_mean", "row_id"]).iloc[0]["policy"]
-        for lvl in levels
-    }
-    if len(set(cheapest.values())) == 1:
-        policy = charts.policy_label(next(iter(cheapest.values())))
+    goal = fmt_pct(target, 0)
+    passing = df[df["meets_target"]]
+    cheapest = {}
+    for lvl in levels:
+        rows = passing[passing[col] == lvl].sort_values(["cost_total_mean", "row_id"])
+        cheapest[lvl] = None if rows.empty else str(rows.iloc[0]["policy"])
+    never = [
+        p
+        for p in charts.ordered_policies(df["policy"].unique().tolist())
+        if p not in set(passing["policy"])
+    ]
+    span = f"({fmt_money(levels[0])}–{fmt_money(levels[-1])})"
+    winners = set(cheapest.values())
+    if winners == {None}:
+        return f"No rule reaches {goal} at any late penalty {span}"
+    if len(winners) == 1:
         title = (
-            f"{policy} is the cheapest rule at every late penalty "
-            f"({fmt_money(levels[0])}–{fmt_money(levels[-1])})"
+            f"{charts.policy_label(next(iter(winners)))} is the cheapest rule that meets {goal} "
+            f"at every late penalty {span}"
         )
     else:
-        lo, hi = levels[0], levels[-1]
+
+        def at(lvl: float) -> str:
+            name = cheapest[lvl]
+            return f"{charts.policy_label(name) if name else 'none'} at {fmt_money(lvl)}"
+
         title = (
-            f"The cheapest rule depends on the late penalty: "
-            f"{charts.policy_label(cheapest[lo])} at {fmt_money(lo)}, "
-            f"{charts.policy_label(cheapest[hi])} at {fmt_money(hi)}"
+            f"The cheapest rule that meets {goal} depends on the late penalty: "
+            f"{at(levels[0])}, {at(levels[-1])}"
         )
-    if "cost_excl_penalty_mean" in df.columns:
-        staff = df.groupby("policy")["cost_excl_penalty_mean"].mean().sort_values()
-        title += f"; {charts.policy_label(str(staff.index[0]))} spends least excluding penalties"
+    if "cost_excl_penalty_mean" in passing.columns and passing["policy"].nunique() > 1:
+        staff = passing.groupby("policy")["cost_excl_penalty_mean"].mean().sort_values()
+        title += (
+            f"; among those, {charts.policy_label(str(staff.index[0]))} spends least "
+            "excluding penalties"
+        )
+    if never:
+        names = " and ".join(charts.policy_label(p) for p in never)
+        title += f"; {names} never {'reach' if len(never) > 1 else 'reaches'} {goal}"
     return title
 
 
@@ -669,7 +693,7 @@ def fig_late_penalty(df: pd.DataFrame, target: float) -> go.Figure:
         "Same runs, two views: what the year costs with late penalties, and what is spent on "
         "capacity · whiskers on total cost = range over repeats"
     )
-    return _finish(fig, title_late_penalty(df), subtitle, footnote("late_penalty", df))
+    return _finish(fig, title_late_penalty(df, target), subtitle, footnote("late_penalty", df))
 
 
 # --- key numbers (markdown) -----------------------------------------------------------------
@@ -812,5 +836,5 @@ def key_numbers_markdown(frames: Mapping[str, pd.DataFrame | None], defaults: Pa
         if name == "cadence":
             out += [title_cadence(df) + ".", ""]
         if name == "late_penalty":
-            out += [title_late_penalty(df) + ".", ""]
+            out += [title_late_penalty(df, target) + ".", ""]
     return "\n".join(out).rstrip() + "\n"
