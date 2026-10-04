@@ -20,11 +20,11 @@ from scout_planner import runs
 MAIN = Path(__file__).resolve().parents[1] / "app" / "main.py"
 TIMEOUT = 60
 PAGES = [
-    "pages/sweep.py",
-    "pages/new_run.py",
-    "pages/runs.py",
-    "pages/run_detail.py",
-    "pages/compare.py",
+    "views/sweep.py",
+    "views/new_run.py",
+    "views/runs.py",
+    "views/run_detail.py",
+    "views/compare.py",
 ]
 
 
@@ -55,6 +55,9 @@ def empty_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 
 def open_page(page: str, **query: str) -> AppTest:
     at = AppTest.from_file(str(MAIN), default_timeout=TIMEOUT)
+    # Run once first: st.navigation registers pages (with their url_path) only on
+    # a run; before that, switch_page cannot match a views/ page by file name.
+    at.run()
     at.switch_page(page)
     for key, value in query.items():
         at.query_params[key] = value
@@ -88,12 +91,12 @@ def test_page_renders_on_empty_root(empty_env, page: str) -> None:
 
 
 def test_empty_states_offer_next_action(empty_env) -> None:
-    runs_page = open_page("pages/runs.py")
+    runs_page = open_page("views/runs.py")
     assert "No runs yet" in [s.value for s in runs_page.subheader]
     button(runs_page, "Start a new run")
-    sweep = open_page("pages/sweep.py")
+    sweep = open_page("views/sweep.py")
     assert "No sweep results yet" in [s.value for s in sweep.subheader]
-    compare = open_page("pages/compare.py")
+    compare = open_page("views/compare.py")
     assert any("at least two finished runs" in i.value for i in compare.info)
 
 
@@ -111,12 +114,12 @@ def test_empty_states_offer_next_action(empty_env) -> None:
     ],
 )
 def test_run_detail_in_every_state(demo_env, name: str) -> None:
-    at = open_page("pages/run_detail.py", run=demo_env["ids"][name])
+    at = open_page("views/run_detail.py", run=demo_env["ids"][name])
     no_exception(at)
 
 
 def test_run_detail_done_leads_with_the_answer(demo_env) -> None:
-    at = open_page("pages/run_detail.py", run=demo_env["ids"]["Demo: Hire for 2x, get 4x"])
+    at = open_page("views/run_detail.py", run=demo_env["ids"]["Demo: Hire for 2x, get 4x"])
     no_exception(at)
     assert at.subheader[0].value.startswith("On time ")
     assert [m.label for m in at.metric][:4] == [
@@ -129,13 +132,13 @@ def test_run_detail_done_leads_with_the_answer(demo_env) -> None:
 
 
 def test_run_detail_interrupted_explains_and_offers_rerun(demo_env) -> None:
-    at = open_page("pages/run_detail.py", run=demo_env["ids"]["Demo: Interrupted run"])
+    at = open_page("views/run_detail.py", run=demo_env["ids"]["Demo: Interrupted run"])
     assert "background worker stopped" in at.error[0].value
     button(at, "Run again")
 
 
 def test_run_detail_unknown_run(demo_env) -> None:
-    at = open_page("pages/run_detail.py", run="20990101-000000-gone")
+    at = open_page("views/run_detail.py", run="20990101-000000-gone")
     no_exception(at)
     assert "doesn't exist" in at.error[0].value
 
@@ -143,7 +146,7 @@ def test_run_detail_unknown_run(demo_env) -> None:
 def test_compare_two_runs(demo_env) -> None:
     ids = demo_env["ids"]
     at = open_page(
-        "pages/compare.py", runs=f"{ids['Demo: Defaults']},{ids['Demo: Earliest deadline first']}"
+        "views/compare.py", runs=f"{ids['Demo: Defaults']},{ids['Demo: Earliest deadline first']}"
     )
     no_exception(at)
     assert any("how work is assigned" in i.value for i in at.info)
@@ -153,23 +156,23 @@ def test_compare_two_runs(demo_env) -> None:
 
 def test_compare_drops_missing_runs(demo_env) -> None:
     ids = demo_env["ids"]
-    at = open_page("pages/compare.py", runs=f"{ids['Demo: Defaults']},20990101-000000-gone")
+    at = open_page("views/compare.py", runs=f"{ids['Demo: Defaults']},20990101-000000-gone")
     no_exception(at)
     assert any("no longer exists" in w.value for w in at.warning)
 
 
 def test_sweep_page_all_growth_levels_and_local_sweep(demo_env) -> None:
-    at = open_page("pages/sweep.py")
+    at = open_page("views/sweep.py")
     no_exception(at)
     radio = at.radio[0]
     radio.set_value("all").run()
     no_exception(at)
-    local = open_page("pages/sweep.py", sweep=f"local:{ui_fixtures.DEMO_SWEEP_ID}")
+    local = open_page("views/sweep.py", sweep=f"local:{ui_fixtures.DEMO_SWEEP_ID}")
     no_exception(local)
 
 
 def test_runs_page_banner_and_tables(demo_env) -> None:
-    at = open_page("pages/runs.py", new=demo_env["ids"]["Demo: Next in line"])
+    at = open_page("views/runs.py", new=demo_env["ids"]["Demo: Next in line"])
     no_exception(at)
     assert at.success[0].value.startswith("Queued 'Demo: Next in line'. It is #1 in line.")
     assert any("couldn't be read" in c.value for c in at.caption)  # the broken folder
@@ -179,7 +182,7 @@ def test_runs_page_banner_and_tables(demo_env) -> None:
 
 
 def test_new_run_submit_creates_a_queued_folder(empty_env) -> None:
-    at = open_page("pages/new_run.py")
+    at = open_page("views/new_run.py")
     no_exception(at)
     button(at, "Run").click().run()
     no_exception(at)
@@ -189,7 +192,7 @@ def test_new_run_submit_creates_a_queued_folder(empty_env) -> None:
 
 
 def test_new_run_change_widget_then_submit(empty_env) -> None:
-    at = open_page("pages/new_run.py")
+    at = open_page("views/new_run.py")
     at.radio(key="w:assignment.policy").set_value("edf").run()
     at.text_input(key="w:name").input("Demo: EDF from the form").run()
     button(at, "Run").click().run()
@@ -200,7 +203,7 @@ def test_new_run_change_widget_then_submit(empty_env) -> None:
 
 
 def test_new_run_invalid_advanced_yaml_blocks_run(empty_env) -> None:
-    at = open_page("pages/new_run.py")
+    at = open_page("views/new_run.py")
     at.text_area(key="w:advanced").input("sim:\n  seeds: 5\n").run()
     no_exception(at)
     assert button(at, "Run").disabled
@@ -209,7 +212,7 @@ def test_new_run_invalid_advanced_yaml_blocks_run(empty_env) -> None:
 
 
 def test_new_run_clone_prefills_and_flags_the_experiment(demo_env) -> None:
-    at = open_page("pages/new_run.py", clone=demo_env["ids"]["Demo: Hire for 2x, get 4x"])
+    at = open_page("views/new_run.py", clone=demo_env["ids"]["Demo: Hire for 2x, get 4x"])
     no_exception(at)
     assert any("Started from 'Demo: Hire for 2x, get 4x'" in i.value for i in at.info)
     assert any("Forecast error experiment" in i.value for i in at.info)
@@ -217,13 +220,13 @@ def test_new_run_clone_prefills_and_flags_the_experiment(demo_env) -> None:
 
 
 def test_new_run_clone_missing_falls_back_to_defaults(demo_env) -> None:
-    at = open_page("pages/new_run.py", clone="20990101-000000-gone")
+    at = open_page("views/new_run.py", clone="20990101-000000-gone")
     no_exception(at)
     assert any("no longer exists" in w.value for w in at.warning)
 
 
 def test_new_run_from_published_sweep_row(demo_env) -> None:
-    at = open_page("pages/new_run.py", sweep="published:headline", row="5")
+    at = open_page("views/new_run.py", sweep="published:headline", row="5")
     no_exception(at)
     assert any("from sweep 'headline'" in i.value for i in at.info)
 
@@ -278,7 +281,7 @@ def test_pages_render_a_real_run(
     at = open_page(page)
     no_exception(at)
     assert not at.error, [e.value for e in at.error]
-    if page == "pages/run_detail.py":
+    if page == "views/run_detail.py":
         assert at.subheader[0].value.startswith("On time ")
         assert not any("Couldn't load" in w.value for w in at.warning)  # every file matched
         assert len(at.get("plotly_chart")) >= 8

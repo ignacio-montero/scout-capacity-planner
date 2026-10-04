@@ -546,7 +546,9 @@ def describe_params(params: Params, january_load: float | None = None) -> list[s
     d, c, t, a, s = params.demand, params.capacity_plan, params.team, params.assignment, params.sim
     cadence = "every day" if a.cadence == "daily" else "once a week"
     unit = "task by task" if a.unit == "task" else "desk review and write-up together"
-    policy = POLICY_LABELS.get(a.policy, a.policy).lower()
+    label = POLICY_LABELS.get(a.policy, a.policy)
+    # Lower-case the first letter for mid-sentence use, but keep acronyms ("EDF").
+    policy = label if label[:3].isupper() else label[:1].lower() + label[1:]
     auto = params.automation
     if auto.enabled:
         tool = (

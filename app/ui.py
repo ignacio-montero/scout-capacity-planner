@@ -34,11 +34,13 @@ from scout_planner.results import Loaded, Summary, load_summary, load_table
 
 REPO_ROOT = runs.REPO_ROOT
 PAGES: dict[str, str] = {
-    "sweep": "pages/sweep.py",
-    "new": "pages/new_run.py",
-    "runs": "pages/runs.py",
-    "run": "pages/run_detail.py",
-    "compare": "pages/compare.py",
+    # Not "pages/": Streamlit auto-discovers a pages/ folder next to the entry
+    # script (legacy multipage mode) and shows "Page not found" on direct URLs.
+    "sweep": "views/sweep.py",
+    "new": "views/new_run.py",
+    "runs": "views/runs.py",
+    "run": "views/run_detail.py",
+    "compare": "views/compare.py",
 }
 TOAST_KEY = "_pending_toasts"
 KNOWN_STATES_KEY = "_known_states"

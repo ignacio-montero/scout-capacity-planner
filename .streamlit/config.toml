@@ -7,6 +7,13 @@ primaryColor = "#237A4B"
 # Local tool: listen on this machine only, never on the LAN or public Wi-Fi.
 [server]
 address = "localhost"
+# Headless: skip Streamlit's first-run email prompt, which blocks (or kills) a
+# launch from `make app` / scripts. The terminal prints the URL to open instead.
+headless = true
+
+# No usage statistics sent to Streamlit.
+[browser]
+gatherUsageStats = false
 
 # Hide the developer toolbar items (including "Deploy"): this app is not deployed.
 [client]

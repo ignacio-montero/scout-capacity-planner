@@ -61,6 +61,9 @@ known-first-party = ["scout_planner"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# app/ on the import path so Streamlit view scripts (app/views/*.py) can `import ui`
+# when opened directly by AppTest; the real app does this in app/main.py.
+pythonpath = ["app"]
 # -ra: summarise skips/xfails at the end, so a skipped guardrail check is visible.
 # --strict-markers: a mistyped marker is an error, not a silently new marker.
 addopts = "-ra --strict-markers"

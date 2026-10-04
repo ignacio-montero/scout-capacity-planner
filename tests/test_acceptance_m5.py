@@ -34,6 +34,9 @@ pytestmark = pytest.mark.slow
 
 def _open(page: str, **query: str) -> AppTest:
     at = AppTest.from_file(str(MAIN), default_timeout=TIMEOUT)
+    # Run once first: st.navigation registers pages (with their url_path) only on
+    # a run; before that, switch_page cannot match a views/ page by file name.
+    at.run()
     at.switch_page(page)
     for key, value in query.items():
         at.query_params[key] = value
@@ -62,7 +65,7 @@ def env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 def test_form_to_queue_to_worker_to_run_detail(env: Path) -> None:
     root = env
     # 1. New run: basic widgets + advanced YAML for a tiny, fast run
-    at = _open("pages/new_run.py")
+    at = _open("views/new_run.py")
     _clean(at)
     at.radio(key="w:assignment.policy").set_value("edf").run()
     at.number_input(key="w:team.full_time_count").set_value(8).run()
@@ -94,7 +97,7 @@ def test_form_to_queue_to_worker_to_run_detail(env: Path) -> None:
     check_run_folder(folder, params)
 
     # 4. Run detail shows every PRD M5 element for the real result
-    detail = _open("pages/run_detail.py", run=status.run_id)
+    detail = _open("views/run_detail.py", run=status.run_id)
     _clean(detail)
     takeaway = detail.subheader[0].value
     assert takeaway.startswith("On time ") and "95% target" in takeaway  # on-time vs 95%
@@ -124,7 +127,7 @@ def test_form_to_queue_to_worker_to_run_detail(env: Path) -> None:
     assert shown["sim.months"] == "1" and shown["Full-time scouts"] == "8"
 
     # 5. Runs page lists it as finished
-    listing = _open("pages/runs.py")
+    listing = _open("views/runs.py")
     _clean(listing)
     assert any("E2E tiny" in str(df.value.to_numpy()) for df in listing.dataframe)
 
@@ -163,7 +166,7 @@ def test_compare_shows_up_to_four_real_runs_side_by_side(env: Path) -> None:
         ("Fifth", {"demand__actual_growth": 1.0}),
     ]
     ids = [_done_run(root, name, **ov) for name, ov in variants]
-    at = _open("pages/compare.py", runs=",".join(ids))  # five asked, four shown
+    at = _open("views/compare.py", runs=",".join(ids))  # five asked, four shown
     _clean(at)
     metric_table = at.dataframe[1].value
     assert list(metric_table.columns) == ["Metric", "Better is", "A", "B", "C", "D"]
