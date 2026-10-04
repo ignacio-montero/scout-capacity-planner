@@ -22,6 +22,7 @@ Conventions (DESIGN_SYSTEM.md sections 2-3):
 from __future__ import annotations
 
 import math
+import numbers
 import textwrap
 from collections.abc import Mapping, Sequence
 from typing import Any
@@ -36,16 +37,32 @@ from scout_planner.formatting import (
     fmt_growth,
     fmt_month,
     fmt_pct,
+    fmt_pct_near,
 )
 
 # --- design tokens (DESIGN_SYSTEM.md section 2.2) --------------------------------
 
-POLICY_ORDER: tuple[str, ...] = ("fcfs", "edf", "optimiser")  # simplest to smartest
-POLICY_COLORS: dict[str, str] = {"fcfs": "#CC79A7", "edf": "#009E73", "optimiser": "#0072B2"}
-POLICY_SYMBOLS: dict[str, str] = {"fcfs": "circle", "edf": "square", "optimiser": "diamond"}
+POLICY_ORDER: tuple[str, ...] = ("fcfs", "edf", "edf_feasible", "optimiser")  # simplest first
+# edf_feasible: Okabe-Ito has no unused colour that passes 3:1 on both themes
+# (its yellow is 1.3:1 on white, its black 1.1:1 on dark), so it takes Paul Tol's
+# olive #999933 (3.0:1 white, 6.3:1 dark), a hue apart from purple, green and
+# blue, plus its own marker (triangle) so colour is never the only cue.
+POLICY_COLORS: dict[str, str] = {
+    "fcfs": "#CC79A7",
+    "edf": "#009E73",
+    "edf_feasible": "#999933",
+    "optimiser": "#0072B2",
+}
+POLICY_SYMBOLS: dict[str, str] = {
+    "fcfs": "circle",
+    "edf": "square",
+    "edf_feasible": "triangle-up",
+    "optimiser": "diamond",
+}
 POLICY_LABELS: dict[str, str] = {
     "fcfs": "First come, first served",
     "edf": "Earliest deadline first",
+    "edf_feasible": "EDF + due-date check",
     "optimiser": "Optimiser",
 }
 EMPLOYMENT_COLORS: dict[str, str] = {"full_time": "#E69F00", "freelance": "#56B4E9"}
@@ -68,6 +85,12 @@ COST_LABELS: dict[str, str] = {
     "cost_automation": "Pre-screen licence",
     "cost_late_penalty": "Late penalties",
 }
+HIRE_MIX_ORDER: tuple[str, ...] = ("rule", "freelance_only", "full_time_only")
+HIRE_MIX_LABELS: dict[str, str] = {
+    "rule": "Planned mix",
+    "freelance_only": "Freelancers only",
+    "full_time_only": "Full-timers only",
+}
 SLOT_LETTERS: tuple[str, ...] = ("A", "B", "C", "D")
 SLOT_DASHES: dict[str, str] = {"A": "solid", "B": "dash", "C": "dot", "D": "dashdot"}
 NEUTRAL = "#808080"  # readable on both Streamlit backgrounds; never pure black/white
@@ -83,6 +106,8 @@ TITLE_SIZE = 18
 # where a one-line 90-character title would be clipped.
 TITLE_WRAP = 58
 SUBTITLE_WRAP = 85
+README_TITLE_WRAP = 92  # a 1200 px wide PNG has room for longer lines
+README_SUBTITLE_WRAP = 130
 SUBTITLE_SIZE = 13
 README_SIZE = (1200, 675)
 README_FOOTNOTE = "Synthetic data · fictional scouting agency"
@@ -120,6 +145,7 @@ def style_figure(
     for_readme: bool = False,
     show_legend: bool | None = None,
     height: int | None = None,
+    footnote: str | None = None,
 ) -> go.Figure:
     """Title (takeaway) + grey subtitle, legend above the plot, margins.
 
@@ -127,17 +153,46 @@ def style_figure(
     ``for_readme=True`` makes a self-contained white figure at 1200x675 with a
     source footnote (a transparent PNG would put dark text on GitHub's dark mode).
     """
-    title_lines = wrap_text(title, TITLE_WRAP)
-    sub_lines = wrap_text(subtitle, SUBTITLE_WRAP) if subtitle else []
+    title_lines = wrap_text(title, README_TITLE_WRAP if for_readme else TITLE_WRAP)
+    sub_wrap = README_SUBTITLE_WRAP if for_readme else SUBTITLE_WRAP
+    sub_lines = wrap_text(subtitle, sub_wrap) if subtitle else []
     text = "<br>".join(title_lines)
     span = f"<span style='font-size:{SUBTITLE_SIZE}px;color:{NEUTRAL}'>"
     for line in sub_lines:
         text += f"<br>{span}{line}</span>"
-    top = 40 + 24 * len(title_lines) + 18 * len(sub_lines)
+    # The top margin is stacked explicitly so nothing overlaps: title block,
+    # then the legend row, then subplot titles (if any), then the plot.
+    legend_on = show_legend if show_legend is not None else len(fig.data) > 1
+    subplot_titles = any(
+        a.yref == "paper" and a.yanchor == "bottom" and (a.y or 0) >= 1
+        for a in fig.layout.annotations
+    )
+    title_px = 20 + 24 * len(title_lines) + 18 * len(sub_lines) + 8
+    legend_px = 30 if legend_on else 0
+    subplot_px = 28 if subplot_titles else 0
+    bottom = 90 if for_readme else 10
+    top = title_px + legend_px + subplot_px
+    total = height or (README_SIZE[1] if for_readme else 450)
+    plot_px = max(total - top - bottom - 50, 100)  # ~50 px for the x axis labels
     fig.update_layout(
-        title={"text": text, "font": {"size": TITLE_SIZE}, "x": 0, "xanchor": "left"},
-        legend={"orientation": "h", "y": 1.02, "yanchor": "bottom", "x": 0, "xanchor": "left"},
-        margin={"t": top, "l": 10, "r": 30, "b": 10},
+        title={
+            "text": text,
+            "font": {"size": TITLE_SIZE},
+            "x": 0,
+            "xanchor": "left",
+            "yref": "container",
+            # A few px below the top edge: multi-line titles ignore ``pad``.
+            "y": 1 - 22 / total,
+            "yanchor": "top",
+        },
+        legend={
+            "orientation": "h",
+            "y": 1 + (subplot_px + 2) / plot_px,
+            "yanchor": "bottom",
+            "x": 0,
+            "xanchor": "left",
+        },
+        margin={"t": top, "l": 10, "r": 30, "b": bottom},
         hovermode="closest",
     )
     if show_legend is not None:
@@ -152,14 +207,16 @@ def style_figure(
             plot_bgcolor="white",
             width=width,
             height=readme_height,
-            margin={"b": 60},
         )
         fig.add_annotation(
-            text=README_FOOTNOTE,
+            text=footnote or README_FOOTNOTE,
             xref="paper",
             yref="paper",
             x=0,
-            y=-0.12,
+            # Paper y=0 is the plot's bottom edge; this lands near the image's
+            # bottom edge, below the axis titles.
+            y=-(bottom - 8) / max(total - top - bottom, 100),
+            yanchor="bottom",
             showarrow=False,
             xanchor="left",
             font={"size": 11, "color": NEUTRAL},
@@ -363,9 +420,21 @@ def best_on_time(df: pd.DataFrame) -> int | None:
 
 
 def describe_sweep_row(row: Mapping[str, Any]) -> str:
-    """``"Optimiser, pre-screen on"``: the short identity used in titles and annotations."""
+    """``"Optimiser, pre-screen on"``: the short identity used in titles and annotations.
+
+    When the row carries a hiring mix and a planning quantile (the headline
+    sweep varies both) they are included: ``"Optimiser, planned mix, P80, pre-screen on"``.
+    """
     screen = "on" if row.get("automation_enabled") else "off"
-    return f"{policy_label(str(row.get('policy')))}, pre-screen {screen}"
+    parts = [policy_label(str(row.get("policy")))]
+    mix = row.get("capacity_plan.hire_mix")
+    if isinstance(mix, str):
+        parts.append(HIRE_MIX_LABELS.get(mix, mix).lower())
+    quantile = row.get("capacity_plan.quantile")
+    if isinstance(quantile, int | float) and not isinstance(quantile, bool):
+        parts.append(f"P{round(float(quantile) * 100)}")
+    parts.append(f"pre-screen {screen}")
+    return ", ".join(parts)
 
 
 def takeaway_sweep(df: pd.DataFrame, target: float, growth: float | None) -> str:
@@ -375,7 +444,7 @@ def takeaway_sweep(df: pd.DataFrame, target: float, growth: float | None) -> str
         row = df[df["row_id"] == best].iloc[0]
         return (
             f"Cheapest way to stay on time{at}: {describe_sweep_row(row)}, "
-            f"{fmt_cost_k(row['cost_total_mean'])} a year"
+            f"{fmt_cost_k(row['cost_total_mean'])} a year" + worst_repeat_note(row, target)
         )
     top = best_on_time(df)
     if top is None:
@@ -383,8 +452,21 @@ def takeaway_sweep(df: pd.DataFrame, target: float, growth: float | None) -> str
     row = df[df["row_id"] == top].iloc[0]
     return (
         f"No setting reaches {fmt_pct(target, 0)}{at}; best is "
-        f"{policy_label(str(row['policy']))} at {fmt_pct(row['on_time_rate_mean'])}"
+        f"{policy_label(str(row['policy']))} at {fmt_pct_near(row['on_time_rate_mean'], target)}"
     )
+
+
+def worst_repeat_note(row: Mapping[str, Any], target: float) -> str:
+    """``"; the worst of 3 simulated years reached 94.97%"`` when a passing setting's
+    worst repeat fell below the target (honest about luck); ``""`` otherwise."""
+    worst = row.get("on_time_rate_min")
+    if worst is None or (isinstance(worst, float) and math.isnan(worst)) or worst >= target:
+        return ""
+    seeds = row.get("sim.seeds")  # a numpy integer from a parquet row: Real, not int
+    years = (
+        f"{int(seeds)} simulated years" if isinstance(seeds, numbers.Real) and seeds else "repeats"
+    )
+    return f"; the worst of {years} reached {fmt_pct_near(worst, target)}"
 
 
 # --- time series: backlog, on-time by month ----------------------------------------
@@ -662,13 +744,14 @@ def fig_cost_split(
                 text=texts,
                 textposition="inside",
                 insidetextanchor="middle",
+                textangle=0,
                 customdata=[
                     [fmt_cost_k(v), fmt_pct(s)] for v, s in zip(values, shares, strict=True)
                 ],
                 hovertemplate=f"{label}: %{{customdata[0]}} (%{{customdata[1]}})<extra></extra>",
             )
         )
-    fig.update_layout(barmode="stack", bargap=0.35)
+    fig.update_layout(barmode="stack", bargap=0.35, legend={"traceorder": "normal"})
     if mode == "share":
         part = parts_by_run[runs_[0]] if runs_ else {}
         title = takeaway_cost_split(part) or "Cost split"
@@ -1090,8 +1173,8 @@ def _highlight(fig: go.Figure, point: pd.Series, text: str, **subplot: Any) -> N
         showarrow=True,
         arrowhead=2,
         arrowcolor=NEUTRAL,
-        ax=40,
-        ay=40,
+        ax=70,
+        ay=120,  # down-right, away from the cluster near the target line
         font={"size": 12},
         align="left",
         xanchor="left",
@@ -1106,6 +1189,8 @@ def fig_sweep_scatter(
     growth: float | str | None = None,
     show_range: bool = False,
     highlight: bool = True,
+    facet: str | None = None,
+    facet_labels: Mapping[Any, str] | None = None,
     for_readme: bool = False,
 ) -> go.Figure:
     """The headline: on-time rate vs total cost, one dot per run.
@@ -1116,6 +1201,10 @@ def fig_sweep_scatter(
     ``None`` puts every row in one panel. Colour + symbol = policy, filled =
     pre-screen on, hollow = off. The cheapest run that meets the target is
     enlarged and annotated; if none does, the best on-time run is.
+
+    ``facet`` (a column, e.g. ``"capacity_plan.hire_mix"``) draws one panel per
+    value on shared axes, labelled with ``facet_labels``; only the overall
+    cheapest passing run is annotated, so the answer stands out.
     """
     df = summary
     if growth not in (None, "all"):
@@ -1132,7 +1221,40 @@ def fig_sweep_scatter(
     y_low = max(0.0, float(df["on_time_rate_mean"].min()) - 0.02)
     if show_range:
         y_low = max(0.0, min(y_low, float(df["on_time_rate_min"].min()) - 0.01))
-    if small_multiples:
+    if facet is not None and facet in df.columns:
+        values = list(dict.fromkeys(df[facet].tolist()))
+        labels = facet_labels or {}
+        order = [v for v in labels if v in values] + [v for v in values if v not in labels]
+        fig = make_subplots(
+            rows=1,
+            cols=len(order),
+            shared_yaxes=True,
+            horizontal_spacing=0.03,
+            subplot_titles=[labels.get(v, str(v)) for v in order],
+        )
+        best = cheapest_passing(df)
+        if best is None:
+            best = best_on_time(df)
+        lo, hi = float(df["cost_total_mean"].min()), float(df["cost_total_mean"].max())
+        pad = max((hi - lo) * 0.06, hi * 0.02)
+        for col, value in enumerate(order, start=1):
+            panel = df[df[facet] == value]
+            _sweep_traces(fig, panel, show_range=show_range, legend=col == 1, row=1, col=col)
+            add_target_line(fig, target, row=1, col=col)
+            if highlight and best is not None and (panel["row_id"] == best).any():
+                _annotate_best(fig, df, target, only=best, row=1, col=col)
+            fig.update_xaxes(
+                title_text="Total cost (k)",
+                ticksuffix="k",
+                tickformat=",.0f",
+                range=[(lo - pad) / 1000, (hi + pad) / 1000],
+                row=1,
+                col=col,
+            )
+        fig.update_yaxes(tickformat=".0%", range=[y_low, 1.0])
+        fig.update_yaxes(title_text="On-time rate", row=1, col=1)
+        title = takeaway_sweep(df, target, levels[0] if len(levels) == 1 else None)
+    elif small_multiples:
         fig = make_subplots(
             rows=1,
             cols=len(levels),
@@ -1172,21 +1294,23 @@ def fig_sweep_scatter(
     return style_figure(fig, title, subtitle, for_readme=for_readme, show_legend=True)
 
 
-def _annotate_best(fig: go.Figure, df: pd.DataFrame, target: float, **subplot: Any) -> None:
+def _annotate_best(
+    fig: go.Figure, df: pd.DataFrame, target: float, only: int | None = None, **subplot: Any
+) -> None:
+    """Enlarge and label the cheapest passing row (or, if none passes, the best on-time
+    row). ``only``: annotate only if that row is the one (facet panels)."""
     best = cheapest_passing(df)
-    if best is not None:
-        row = df[df["row_id"] == best].iloc[0]
-        text = (
-            f"Cheapest that meets {fmt_pct(target, 0)}:<br>{describe_sweep_row(row)}"
-            f"<br>{fmt_cost_k(row['cost_total_mean'])} · {fmt_pct(row['on_time_rate_mean'])}"
-        )
-    else:
-        top = best_on_time(df)
-        if top is None:
-            return
-        row = df[df["row_id"] == top].iloc[0]
-        text = (
-            f"Best on time (misses target):<br>{describe_sweep_row(row)}"
-            f"<br>{fmt_cost_k(row['cost_total_mean'])} · {fmt_pct(row['on_time_rate_mean'])}"
-        )
+    passes = best is not None
+    if not passes:
+        best = best_on_time(df)
+    if best is None or (only is not None and best != only):
+        return
+    row = df[df["row_id"] == best].iloc[0]
+    heading = (
+        f"Cheapest that meets {fmt_pct(target, 0)}" if passes else "Best on time (misses target)"
+    )
+    text = (
+        f"{heading}:<br>{describe_sweep_row(row)}<br>{fmt_cost_k(row['cost_total_mean'])} · "
+        f"{fmt_pct_near(row['on_time_rate_mean'], target)}"
+    )
     _highlight(fig, row, text, **subplot)

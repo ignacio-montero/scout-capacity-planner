@@ -246,10 +246,10 @@ def test_changed_settings() -> None:
     ("overrides", "expected"),
     [
         ({}, "Defaults"),
-        ({"capacity_plan.assumed_growth": 2.0}, "optimiser · 4x actual · 2x assumed"),
+        ({"capacity_plan.assumed_growth": 2.0}, "EDF + due-date check · 4x actual · 2x assumed"),
         ({"assignment.policy": "edf"}, "earliest deadline"),
-        ({"automation.enabled": True}, "optimiser · pre-screen on"),
-        ({"cost.late_penalty": 2000.0}, "optimiser · cost of one late report 2,000"),
+        ({"automation.enabled": True}, "EDF + due-date check · pre-screen on"),
+        ({"cost.late_penalty": 2000.0}, "EDF + due-date check · cost of one late report 2,000"),
     ],
 )
 def test_auto_run_name(overrides, expected) -> None:
@@ -269,7 +269,8 @@ def test_auto_run_name_is_bounded() -> None:
 def test_runtime_estimate_greedy_is_fast() -> None:
     edf = apply_overrides(DEFAULTS, {"assignment.policy": "edf"})
     assert "under 30 s" in vm.runtime_caption(edf)
-    assert "min" in vm.runtime_caption(DEFAULTS)
+    optimiser = apply_overrides(DEFAULTS, {"assignment.policy": "optimiser"})
+    assert "min" in vm.runtime_caption(optimiser)
 
 
 # --- takeaway, KPIs -----------------------------------------------------------------------
@@ -436,3 +437,27 @@ def test_unknown_advanced_keys_flow_through(monkeypatch: pytest.MonkeyPatch) -> 
     edited = apply_overrides(DEFAULTS, {"assignment.horizon_days": 5})
     diff = vm.param_diff([DEFAULTS, edited])
     assert diff["Setting"].tolist() == ["assignment.horizon_days"]
+
+
+def test_near_target_formatting_never_rounds_a_miss_into_a_pass() -> None:
+    from scout_planner.formatting import fmt_pct_near, fmt_pts_near
+
+    assert fmt_pct_near(0.9497, 0.95) == "94.97%"
+    assert fmt_pct_near(0.9013, 0.95) == "90.1%"
+    assert fmt_pts_near(-0.0003) == "0.03 pts"
+    assert fmt_pts_near(0.016) == "1.6 pts"
+    s = summary(0.9497, lo=0.94, hi=0.955, cost_total=1_000_000)
+    sentence = vm.run_takeaway(s, DEFAULTS)
+    assert sentence.startswith("On time 94.97%: 0.03 pts below the 95% target")
+
+
+def test_policy_options_follow_the_config() -> None:
+    from typing import get_args
+
+    from scout_planner.config import AssignmentParams
+
+    allowed = set(get_args(AssignmentParams.model_fields["policy"].annotation))
+    spec = vm.PARAM_UI["assignment.policy"]
+    assert set(spec.options) == allowed
+    assert len(spec.captions) == len(spec.options) and all(spec.captions)
+    assert "edf_feasible" in vm.POLICY_CAPTIONS  # ready for when the config allows it

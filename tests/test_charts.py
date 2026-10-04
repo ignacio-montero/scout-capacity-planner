@@ -58,8 +58,14 @@ def title(fig: go.Figure) -> str:
 
 
 def test_tokens_are_the_okabe_ito_values() -> None:
-    assert charts.POLICY_COLORS == {"fcfs": "#CC79A7", "edf": "#009E73", "optimiser": "#0072B2"}
-    assert charts.POLICY_ORDER == ("fcfs", "edf", "optimiser")
+    assert charts.POLICY_COLORS == {
+        "fcfs": "#CC79A7",
+        "edf": "#009E73",
+        "edf_feasible": "#999933",  # Paul Tol olive: no unused Okabe-Ito colour passes 3:1
+        "optimiser": "#0072B2",
+    }
+    assert charts.POLICY_ORDER == ("fcfs", "edf", "edf_feasible", "optimiser")
+    assert len(set(charts.POLICY_COLORS.values())) == len(set(charts.POLICY_SYMBOLS.values())) == 4
     assert set(charts.POLICY_SYMBOLS) == set(charts.POLICY_ORDER)
     assert charts.COST_COLORS["cost_late_penalty"] == "#D55E00"
     assert charts.SLOT_DASHES == {"A": "solid", "B": "dash", "C": "dot", "D": "dashdot"}

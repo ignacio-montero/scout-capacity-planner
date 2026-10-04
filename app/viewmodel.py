@@ -17,14 +17,14 @@ import datetime as dt
 import math
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, get_args
 
 import pandas as pd
 import yaml
 from pydantic import ValidationError
 
 from scout_planner.charts import POLICY_LABELS, POLICY_ORDER, SLOT_LETTERS
-from scout_planner.config import Params, apply_overrides
+from scout_planner.config import AssignmentParams, Params, apply_overrides
 from scout_planner.formatting import (
     DASH,
     fmt_cost_k,
@@ -35,12 +35,36 @@ from scout_planner.formatting import (
     fmt_growth,
     fmt_money,
     fmt_pct,
+    fmt_pct_near,
     fmt_pts,
+    fmt_pts_near,
     fmt_when,
 )
 from scout_planner.results import MetricStat, Summary, flatten_params
 
+
 # No __all__: ui.py re-exports every public name here with a star import.
+def _allowed_policies() -> tuple[str, ...]:
+    """Policies the config accepts, in the canonical simplest-to-smartest order.
+
+    Read from the ``Literal`` on ``AssignmentParams.policy``, so a policy added
+    to config.py appears in the form without touching the UI (and one the
+    config doesn't accept yet is never offered).
+    """
+    allowed = set(get_args(AssignmentParams.model_fields["policy"].annotation))
+    known = [p for p in POLICY_ORDER if p in allowed]
+    return tuple(known + sorted(allowed - set(known)))
+
+
+POLICY_OPTIONS: tuple[str, ...] = _allowed_policies()
+POLICY_CAPTIONS: dict[str, str] = {
+    "fcfs": "Oldest request first",
+    "edf": "Most urgent first",
+    "edf_feasible": "Earliest deadline first, but only promises work a scout can finish "
+    "by its due date",
+    "optimiser": "Plans the best fit each round; slowest",
+}
+
 HIDDEN_KEYS = frozenset({"schema_version"})  # managed by config.py, never by the user
 SAME_GROWTH = "_same_growth"  # draft flag: "Same as actual growth" checkbox
 
@@ -193,9 +217,8 @@ _PARAMS: tuple[ParamUI, ...] = (
     ParamUI(
         "assignment.policy", "Who does what", "assignment", "radio",
         _help("The rule that decides which scout does which task.", "assignment.policy"),
-        lambda v: POLICY_LABELS.get(v, v), options=POLICY_ORDER, option_labels=POLICY_LABELS,
-        captions=("Oldest request first", "Most urgent first",
-                  "Plans the best fit each round; slowest"),
+        lambda v: POLICY_LABELS.get(v, v), options=POLICY_OPTIONS, option_labels=POLICY_LABELS,
+        captions=tuple(POLICY_CAPTIONS.get(p, "") for p in POLICY_OPTIONS),
         horizontal=False,
     ),
     ParamUI(
@@ -581,7 +604,12 @@ def changed_settings(params: Params, reference: Params) -> list[Change]:
     ]
 
 
-POLICY_SHORT = {"fcfs": "first come", "edf": "earliest deadline", "optimiser": "optimiser"}
+POLICY_SHORT = {
+    "fcfs": "first come",
+    "edf": "earliest deadline",
+    "edf_feasible": "EDF + due-date check",
+    "optimiser": "optimiser",
+}
 NAME_MAX = 60
 
 
@@ -652,13 +680,14 @@ def run_takeaway(summary: Summary, params: Params) -> str:
     gap = stat.mean - target
     cost = summary.mean("cost_total")
     cost_part = f", at {fmt_cost_k(cost)} a year" if cost is not None else ""
-    points = abs(round(gap * 100, 1))
-    if points == 0:
+    if gap == 0:
         where = f"right at the {fmt_pct(target, 0)} target"
     else:
+        # Near the target the gap gets 2 decimals: 94.97% is "0.03 pts below",
+        # never a rounded "0.0 pts" that reads like a pass.
         side = "above" if gap > 0 else "below"
-        where = f"{points:.1f} pts {side} the {fmt_pct(target, 0)} target"
-    sentence = f"On time {fmt_pct(stat.mean)}: {where}{cost_part}."
+        where = f"{fmt_pts_near(gap)} {side} the {fmt_pct(target, 0)} target"
+    sentence = f"On time {fmt_pct_near(stat.mean, target)}: {where}{cost_part}."
     if stat.min < target <= stat.max:
         sentence += " Close call: some repeats pass, some don't."
     return sentence
@@ -700,7 +729,11 @@ def kpi_cards(summary: Summary, params: Params, late: MetricStat | None = None) 
             fmt_pct(on_time.mean if on_time else None),
             f"{fmt_pts(on_time.mean - target)} vs {fmt_pct(target, 0)} target" if on_time else None,
             "normal",
-            ("Single repeat, no range" if single else f"Range {_range(on_time, fmt_pct)} {repeats}")
+            (
+                "Single repeat, no range"
+                if single
+                else f"Range {_range(on_time, lambda v: fmt_pct_near(v, target))} {repeats}"
+            )
             + risk,
             "Share of reports delivered within the promised days.",
         ),

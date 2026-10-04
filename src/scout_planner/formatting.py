@@ -25,7 +25,9 @@ __all__ = [
     "fmt_money",
     "fmt_month",
     "fmt_pct",
+    "fmt_pct_near",
     "fmt_pts",
+    "fmt_pts_near",
     "fmt_when",
 ]
 
@@ -41,6 +43,24 @@ def fmt_pct(fraction: float | None, decimals: int = 1) -> str:
     if _missing(fraction):
         return DASH
     return f"{fraction * 100:.{decimals}f}%"
+
+
+def fmt_pct_near(fraction: float | None, target: float, band: float = 0.005) -> str:
+    """A rate next to a target: 2 decimals within ``band`` (0.5 pts) of it, else 1.
+
+    94.97% must not read "95.0%" next to a 95% target: that looks like a pass.
+    """
+    if _missing(fraction):
+        return DASH
+    return fmt_pct(fraction, 2 if abs(fraction - target) < band else 1)
+
+
+def fmt_pts_near(delta: float | None) -> str:
+    """Unsigned size of a gap in points: 2 decimals under 0.1 pts (``"0.03 pts"``), else 1."""
+    if _missing(delta):
+        return DASH
+    points = abs(delta) * 100
+    return f"{points:.2f} pts" if points < 0.1 else f"{points:.1f} pts"
 
 
 def fmt_pts(delta: float | None) -> str:

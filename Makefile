@@ -58,8 +58,8 @@ sweep:  ## expand config/sweeps/$(SWEEP).yaml into runs and execute them (SWEEP=
 app:  ## start the simulator app and its background worker (Ctrl-C stops both)
 	uv run python -m scout_planner.serve
 
-charts:
-	$(call todo,M6)
+charts:  ## README charts + key numbers from data/published/ -> docs/img/
+	uv run python scripts/make_readme_charts.py
 
 all: test lint  ## tests + lint, the dev pipeline end to end, then the quick sweep
 	$(MAKE) data forecast plan simulate PARAMS=$(PARAMS)
