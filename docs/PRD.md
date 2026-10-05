@@ -199,4 +199,4 @@ An LLM call parses them into `position_group`, `region`, `language`,
 
 ## 8. Open questions
 
-Tracked in `NEXT_STEPS.md` → "Open decisions".
+Resolved; see `DECISIONS.md` (D-010, D-012–D-014, D-028).

@@ -9,8 +9,7 @@ choice is ambiguous: pick the simpler option, log it here, move on.
 ### D-001 — The brief is split into canonical docs and taken out of git (2026-10-02)
 **What.** The original brief now lives in `.private/original-brief.md`
 (gitignored) and is superseded by `PRD.md` (what/why), `ARCHITECTURE.md`
-(how), `DATA_CONTRACTS.md` (stage-to-stage schemas), this log and
-`NEXT_STEPS.md`.
+(how), `DATA_CONTRACTS.md` (stage-to-stage schemas) and this log.
 **Why.** One source of truth per question; changes to the brief live here
 rather than as silent edits. The brief itself also quotes the guardrail's
 banned vocabulary verbatim, so committing it would break the guardrail.

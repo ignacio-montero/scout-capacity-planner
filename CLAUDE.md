@@ -17,7 +17,7 @@ Python 3.12, uv, pandas, statsmodels, OR-Tools CP-SAT, plotly, streamlit.
 - `docs/DATA_CONTRACTS.md`: run folder, `status.json`, parquet schemas, `assign()`.
 - `docs/PARAMETERS.md`: every simulator input with defaults (spec for `config.py`).
 - `docs/DECISIONS.md`: every deviation from the original brief (D-001…D-030).
-- `docs/NEXT_STEPS.md`: status, next tasks, open decisions (Q5, Q6).
+- `docs/OPTIMISATION_CASE_STUDY.md`: optimised assignment vs FCFS (business reader).
 
 ## Guardrails (hard rules)
 - **Football scouting only.** No reference to any other industry, real
@@ -43,9 +43,8 @@ many runs from a YAML file.
   policies, day-by-day simulation, run pipeline, sweeps, run store + worker,
   Streamlit app), README chart export, published sweep summaries. Three red-team
   rounds (D-021, D-023, D-029). Default policy is `edf_feasible` (D-030).
-  M6 done: sweeps re-run, charts exported, README written (uncommitted, like
-  all .md files).
-  See `docs/OVERNIGHT_REPORT.md` for the session log and decisions O-1…
+  M6 done: sweeps re-run, charts exported, README + case study written and
+  committed.
 - Demo the UI: `uv run python scripts/make_demo_runs.py --clean` then
   `SCOUT_RUNS_ROOT=data/runs_demo SCOUT_PUBLISHED_DIR=data/published_demo uv run streamlit run app/main.py`.
 - GitHub: `ignacio-montero/scout-capacity-planner` (private), branch `main`.

@@ -395,7 +395,6 @@ scout-capacity-planner/
 - [`docs/DATA_CONTRACTS.md`](docs/DATA_CONTRACTS.md): run folder, status file, schemas.
 - [`docs/PARAMETERS.md`](docs/PARAMETERS.md): every input with its default.
 - [`docs/DECISIONS.md`](docs/DECISIONS.md): decisions D-001 to D-030 and why.
-- [`docs/NEXT_STEPS.md`](docs/NEXT_STEPS.md): status and open questions.
 - [`docs/img/key_numbers.md`](docs/img/key_numbers.md): every published number.
 
 ## Licence

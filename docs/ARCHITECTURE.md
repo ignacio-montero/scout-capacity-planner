@@ -87,7 +87,7 @@ scout-capacity-planner/
 ├── data/                   # gitignored, except data/published/
 │   ├── runs/<run_id>/      # one folder per run (gitignored)
 │   └── published/          # committed: headline sweep summary for README + app
-├── docs/                   # PRD, ARCHITECTURE, DATA_CONTRACTS, PARAMETERS, DECISIONS, NEXT_STEPS, img/
+├── docs/                   # PRD, ARCHITECTURE, DATA_CONTRACTS, PARAMETERS, DECISIONS, OPTIMISATION_CASE_STUDY, img/
 ├── tests/
 └── .private/               # gitignored: original brief, guardrail term list
 ```
